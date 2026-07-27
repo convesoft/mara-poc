@@ -686,14 +686,19 @@ fn run_measurement_loop(
                 break;
             }
         };
-        write_bytes(
+        let stdout_write = write_bytes(
             &evidence.join(format!("run-{run:02}.stdout.json")),
             &outcome.stdout,
-        )?;
-        write_bytes(
+        );
+        let stderr_write = write_bytes(
             &evidence.join(format!("run-{run:02}.stderr")),
             &outcome.stderr,
-        )?;
+        );
+        if stdout_write.is_err() || stderr_write.is_err() {
+            inconclusive = true;
+            persist_unavailable_records(evidence, &mut records, run as u8, "capture_unavailable")?;
+            break;
+        }
 
         let revalidation = revalidate_fixture(fixture, manifest, pin);
         let mut record = measurement_record(run as u8, outcome, &revalidation);
@@ -1701,6 +1706,7 @@ fn revalidate_fixture(
     manifest: &Path,
     pin: &ManifestPin,
 ) -> Result<FixtureRevalidation> {
+    require_regular_file(manifest, "qualification manifest")?;
     match fs::symlink_metadata(fixture) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -2411,6 +2417,10 @@ mod tests {
                 .iter()
                 .all(|entry| entry.observed_sha256.is_none() && !entry.matched)
         );
+
+        fs::remove_file(&fixture).expect("remove fixture symlink");
+        fs::remove_file(&manifest).expect("remove manifest");
+        assert!(revalidate_fixture(&fixture, &manifest, &pin).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -2568,6 +2578,80 @@ mod tests {
         )
         .expect("mismatched oracle record");
         assert!(parse_oracle_fixture_files(&record, &pin).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stream_persistence_failure_produces_inconclusive_records_and_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let fixture = temporary.path().join("fixture");
+        let evidence = temporary.path().join("evidence");
+        let manifest = temporary.path().join("manifest");
+        let mara = temporary.path().join("mara");
+        fs::create_dir(&fixture).expect("fixture directory");
+        fs::create_dir(&evidence).expect("evidence directory");
+        write_fixture(&fixture).expect("fixture");
+        fs::write(&manifest, "pinned manifest\n").expect("manifest");
+        fs::write(
+            &mara,
+            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
+        )
+        .expect("fake Mara");
+        let mut permissions = fs::metadata(&mara).expect("Mara metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mara, permissions).expect("Mara permissions");
+        let pin = ManifestPin {
+            sha256: hash_file(&manifest).expect("manifest hash"),
+            entries: fixture_digests(&fixture).into_iter().collect(),
+        };
+        let oracle_fixture_files = pin
+            .entries
+            .iter()
+            .map(|(path, digest)| FixtureFile {
+                path: path.clone(),
+                expected_sha256: digest.clone(),
+                observed_sha256: Some(digest.clone()),
+                matched: true,
+            })
+            .collect();
+        fs::write(evidence.join("run-01.stdout.json"), "protected\n")
+            .expect("protected stream path");
+
+        let measurement = run_measurement_loop(
+            &mara,
+            &fixture,
+            &evidence,
+            &manifest,
+            &pin,
+            oracle_fixture_files,
+        )
+        .expect("inconclusive measurement loop");
+
+        assert!(measurement.inconclusive);
+        assert_eq!(measurement.records.len(), RUN_COUNT);
+        assert!(measurement.records.iter().all(|record| {
+            record.error.as_deref() == Some("capture_unavailable") && !record.passed
+        }));
+        write_summary(
+            &evidence,
+            SummaryInputs {
+                source_commit: "source-commit".into(),
+                xtask_sha256: "0".repeat(64),
+                mara_sha256: "1".repeat(64),
+                expected_manifest_sha256: Some(pin.sha256),
+                fixture_files: measurement.fixture_files,
+                records: measurement.records,
+                result: "inconclusive",
+            },
+        )
+        .expect("inconclusive summary");
+        assert!(
+            fs::read_to_string(evidence.join("qualification-summary.json"))
+                .expect("qualification summary")
+                .contains("\"result\": \"inconclusive\"")
+        );
     }
 
     #[cfg(target_os = "linux")]
