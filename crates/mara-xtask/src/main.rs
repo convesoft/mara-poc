@@ -677,12 +677,12 @@ fn run_measurement_loop(
             Ok(outcome) => outcome,
             Err(_) => {
                 inconclusive = true;
-                persist_unavailable_records(
+                let _ = persist_unavailable_records(
                     evidence,
                     &mut records,
                     run as u8,
                     "capture_unavailable",
-                )?;
+                );
                 break;
             }
         };
@@ -696,7 +696,12 @@ fn run_measurement_loop(
         );
         if stdout_write.is_err() || stderr_write.is_err() {
             inconclusive = true;
-            persist_unavailable_records(evidence, &mut records, run as u8, "capture_unavailable")?;
+            let _ = persist_unavailable_records(
+                evidence,
+                &mut records,
+                run as u8,
+                "capture_unavailable",
+            );
             break;
         }
 
@@ -705,19 +710,41 @@ fn run_measurement_loop(
         match revalidation {
             Ok(snapshot) => {
                 fixture_files = snapshot.files.clone();
-                write_json(
+                if write_json(
                     &evidence.join(format!("run-{run:02}.measurement.json")),
                     &record,
-                )?;
+                )
+                .is_err()
+                {
+                    inconclusive = true;
+                    let _ = persist_unavailable_records(
+                        evidence,
+                        &mut records,
+                        run as u8,
+                        "capture_unavailable",
+                    );
+                    break;
+                }
                 records.push(record);
                 if !snapshot.integrity_matches {
                     for withheld in run + 1..=RUN_COUNT {
                         let withheld_record =
                             withheld_record(withheld as u8, "fixture_integrity_changed");
-                        write_json(
+                        if write_json(
                             &evidence.join(format!("run-{withheld:02}.measurement.json")),
                             &withheld_record,
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            inconclusive = true;
+                            let _ = persist_unavailable_records(
+                                evidence,
+                                &mut records,
+                                withheld as u8,
+                                "capture_unavailable",
+                            );
+                            break;
+                        }
                         records.push(withheld_record);
                     }
                     break;
@@ -728,18 +755,38 @@ fn run_measurement_loop(
                 record.fixture_verified = None;
                 record.passed = false;
                 record.error = Some("fixture_revalidation_unavailable".into());
-                write_json(
+                if write_json(
                     &evidence.join(format!("run-{run:02}.measurement.json")),
                     &record,
-                )?;
+                )
+                .is_err()
+                {
+                    let _ = persist_unavailable_records(
+                        evidence,
+                        &mut records,
+                        run as u8,
+                        "capture_unavailable",
+                    );
+                    break;
+                }
                 records.push(record);
                 for withheld in run + 1..=RUN_COUNT {
                     let withheld_record =
                         withheld_record(withheld as u8, "fixture_revalidation_unavailable");
-                    write_json(
+                    if write_json(
                         &evidence.join(format!("run-{withheld:02}.measurement.json")),
                         &withheld_record,
-                    )?;
+                    )
+                    .is_err()
+                    {
+                        let _ = persist_unavailable_records(
+                            evidence,
+                            &mut records,
+                            withheld as u8,
+                            "capture_unavailable",
+                        );
+                        break;
+                    }
                     records.push(withheld_record);
                 }
                 break;
@@ -1121,8 +1168,8 @@ fn storage_info(path: &Path) -> Result<StorageInfo> {
             )));
         }
         let block_size = statvfs.f_frsize as u64;
-        let filesystem_type = format!("{:x}", statfs.f_type as u64);
-        let filesystem_magic = statfs.f_type as u64;
+        let filesystem_magic = normalize_linux_filesystem_magic(statfs.f_type);
+        let filesystem_type = format!("{filesystem_magic:x}");
         Ok(StorageInfo {
             filesystem_type,
             total_bytes: statvfs.f_blocks as u64 * block_size,
@@ -1167,6 +1214,11 @@ fn storage_info(path: &Path) -> Result<StorageInfo> {
             "qualification storage checks are supported only on Linux and macOS".into(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_filesystem_magic(value: libc::c_long) -> u64 {
+    value as u32 as u64
 }
 
 fn emit_precondition(
@@ -1428,16 +1480,19 @@ fn persist_unavailable_records(
     records: &mut Vec<MeasurementRecord>,
     first_run: u8,
     error: &str,
-) -> Result<()> {
+) -> Option<ToolError> {
+    let mut first_write_error = None;
     for run in first_run..=RUN_COUNT as u8 {
         let record = unavailable_record(run, error);
-        write_json(
+        if let Err(write_error) = write_json(
             &evidence.join(format!("run-{run:02}.measurement.json")),
             &record,
-        )?;
+        ) {
+            first_write_error.get_or_insert(write_error);
+        }
         records.push(record);
     }
-    Ok(())
+    first_write_error
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1449,7 +1504,7 @@ fn persist_oracle_unavailable_summary(
     error: &str,
 ) -> Result<()> {
     let mut records = Vec::with_capacity(RUN_COUNT);
-    persist_unavailable_records(evidence, &mut records, 1, error)?;
+    let record_error = persist_unavailable_records(evidence, &mut records, 1, error);
     write_summary(
         evidence,
         SummaryInputs {
@@ -1465,7 +1520,11 @@ fn persist_oracle_unavailable_summary(
                 "inconclusive"
             },
         },
-    )
+    )?;
+    match record_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2129,6 +2188,14 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_filesystem_magic_uses_unsigned_32_bit_value() {
+        let signed_ramfs = 0x8584_58f6_u32 as i32 as libc::c_long;
+
+        assert_eq!(normalize_linux_filesystem_magic(signed_ramfs), 0x8584_58f6);
+    }
+
     #[test]
     fn measurement_requires_a_valid_generation_storage_record() {
         let temporary = tempfile::tempdir().expect("temporary root");
@@ -2582,76 +2649,82 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn stream_persistence_failure_produces_inconclusive_records_and_summary() {
+    fn evidence_persistence_failure_produces_inconclusive_records_and_summary() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let fixture = temporary.path().join("fixture");
-        let evidence = temporary.path().join("evidence");
-        let manifest = temporary.path().join("manifest");
-        let mara = temporary.path().join("mara");
-        fs::create_dir(&fixture).expect("fixture directory");
-        fs::create_dir(&evidence).expect("evidence directory");
-        write_fixture(&fixture).expect("fixture");
-        fs::write(&manifest, "pinned manifest\n").expect("manifest");
-        fs::write(
-            &mara,
-            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
-        )
-        .expect("fake Mara");
-        let mut permissions = fs::metadata(&mara).expect("Mara metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&mara, permissions).expect("Mara permissions");
-        let pin = ManifestPin {
-            sha256: hash_file(&manifest).expect("manifest hash"),
-            entries: fixture_digests(&fixture).into_iter().collect(),
-        };
-        let oracle_fixture_files = pin
-            .entries
-            .iter()
-            .map(|(path, digest)| FixtureFile {
-                path: path.clone(),
-                expected_sha256: digest.clone(),
-                observed_sha256: Some(digest.clone()),
-                matched: true,
-            })
-            .collect();
-        fs::write(evidence.join("run-01.stdout.json"), "protected\n")
-            .expect("protected stream path");
+        for protected_path in ["run-01.stdout.json", "run-01.measurement.json"] {
+            let temporary = tempfile::tempdir().expect("temporary root");
+            let fixture = temporary.path().join("fixture");
+            let evidence = temporary.path().join("evidence");
+            let manifest = temporary.path().join("manifest");
+            let mara = temporary.path().join("mara");
+            fs::create_dir(&fixture).expect("fixture directory");
+            fs::create_dir(&evidence).expect("evidence directory");
+            write_fixture(&fixture).expect("fixture");
+            fs::write(&manifest, "pinned manifest\n").expect("manifest");
+            fs::write(
+                &mara,
+                "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
+            )
+            .expect("fake Mara");
+            let mut permissions = fs::metadata(&mara).expect("Mara metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&mara, permissions).expect("Mara permissions");
+            let pin = ManifestPin {
+                sha256: hash_file(&manifest).expect("manifest hash"),
+                entries: fixture_digests(&fixture).into_iter().collect(),
+            };
+            let oracle_fixture_files = pin
+                .entries
+                .iter()
+                .map(|(path, digest)| FixtureFile {
+                    path: path.clone(),
+                    expected_sha256: digest.clone(),
+                    observed_sha256: Some(digest.clone()),
+                    matched: true,
+                })
+                .collect();
+            fs::write(evidence.join(protected_path), "protected\n")
+                .expect("protected evidence path");
 
-        let measurement = run_measurement_loop(
-            &mara,
-            &fixture,
-            &evidence,
-            &manifest,
-            &pin,
-            oracle_fixture_files,
-        )
-        .expect("inconclusive measurement loop");
+            let measurement = run_measurement_loop(
+                &mara,
+                &fixture,
+                &evidence,
+                &manifest,
+                &pin,
+                oracle_fixture_files,
+            )
+            .expect("inconclusive measurement loop");
 
-        assert!(measurement.inconclusive);
-        assert_eq!(measurement.records.len(), RUN_COUNT);
-        assert!(measurement.records.iter().all(|record| {
-            record.error.as_deref() == Some("capture_unavailable") && !record.passed
-        }));
-        write_summary(
-            &evidence,
-            SummaryInputs {
-                source_commit: "source-commit".into(),
-                xtask_sha256: "0".repeat(64),
-                mara_sha256: "1".repeat(64),
-                expected_manifest_sha256: Some(pin.sha256),
-                fixture_files: measurement.fixture_files,
-                records: measurement.records,
-                result: "inconclusive",
-            },
-        )
-        .expect("inconclusive summary");
-        assert!(
-            fs::read_to_string(evidence.join("qualification-summary.json"))
-                .expect("qualification summary")
-                .contains("\"result\": \"inconclusive\"")
-        );
+            assert!(measurement.inconclusive, "{protected_path}");
+            assert_eq!(measurement.records.len(), RUN_COUNT, "{protected_path}");
+            assert!(
+                measurement.records.iter().all(|record| {
+                    record.error.as_deref() == Some("capture_unavailable") && !record.passed
+                }),
+                "{protected_path}"
+            );
+            write_summary(
+                &evidence,
+                SummaryInputs {
+                    source_commit: "source-commit".into(),
+                    xtask_sha256: "0".repeat(64),
+                    mara_sha256: "1".repeat(64),
+                    expected_manifest_sha256: Some(pin.sha256),
+                    fixture_files: measurement.fixture_files,
+                    records: measurement.records,
+                    result: "inconclusive",
+                },
+            )
+            .expect("inconclusive summary");
+            assert!(
+                fs::read_to_string(evidence.join("qualification-summary.json"))
+                    .expect("qualification summary")
+                    .contains("\"result\": \"inconclusive\""),
+                "{protected_path}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2773,8 +2846,10 @@ mod tests {
     fn capture_failure_is_serialized_for_the_current_and_withheld_runs() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let mut records = Vec::new();
-        persist_unavailable_records(temporary.path(), &mut records, 3, "capture_unavailable")
-            .expect("capture evidence");
+        assert!(
+            persist_unavailable_records(temporary.path(), &mut records, 3, "capture_unavailable")
+                .is_none()
+        );
         assert_eq!(records.len(), 3);
         assert_eq!(
             records.iter().map(|record| record.run).collect::<Vec<_>>(),
