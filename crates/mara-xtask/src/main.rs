@@ -549,8 +549,7 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
         &storage_record,
     )?;
 
-    let mara = source_repo.join("target/release/mara");
-    require_regular_file(&mara, "target/release/mara")?;
+    let mara = canonical_target_executable(&source_repo, "release", "mara", "target/release/mara")?;
     let manifest = source_repo.join("tests/qualification/scale-v01.SHA256SUMS");
     let script = source_repo.join("tests/qualification/verify-scale-v01.sh");
 
@@ -579,7 +578,6 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
         }
     };
 
-    let mut records = Vec::with_capacity(RUN_COUNT);
     let pin = match pin {
         Err(oracle_error) => {
             persist_oracle_unavailable_summary(
@@ -594,6 +592,54 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
         Ok(pin) => pin,
     };
     let expected_manifest_sha256 = Some(pin.sha256.clone());
+    let measurement = run_measurement_loop(&mara, &fixture, &evidence, &manifest, &pin)?;
+    let records = measurement.records;
+    let fixture_files = measurement.fixture_files;
+    let inconclusive = measurement.inconclusive;
+
+    let passed = records.len() == RUN_COUNT && records.iter().all(|record| record.passed);
+    let result = if inconclusive {
+        "inconclusive"
+    } else if passed {
+        "passed"
+    } else {
+        "failed"
+    };
+    write_summary(
+        &evidence,
+        SummaryInputs {
+            source_commit,
+            xtask_sha256,
+            mara_sha256,
+            expected_manifest_sha256,
+            fixture_files,
+            records,
+            result,
+        },
+    )?;
+    if passed {
+        Ok(())
+    } else {
+        Err(ToolError("scale qualification did not pass".into()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct MeasurementLoopResult {
+    records: Vec<MeasurementRecord>,
+    fixture_files: Vec<FixtureFile>,
+    inconclusive: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn run_measurement_loop(
+    mara: &Path,
+    fixture: &Path,
+    evidence: &Path,
+    manifest: &Path,
+    pin: &ManifestPin,
+) -> Result<MeasurementLoopResult> {
+    let mut records = Vec::with_capacity(RUN_COUNT);
     let mut fixture_files = pin
         .entries
         .iter()
@@ -607,12 +653,12 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
     let mut inconclusive = false;
 
     for run in 1..=RUN_COUNT {
-        let outcome = match run_exact_child(&mara, &fixture) {
+        let outcome = match run_exact_child(mara, fixture) {
             Ok(outcome) => outcome,
             Err(_) => {
                 inconclusive = true;
                 persist_unavailable_records(
-                    &evidence,
+                    evidence,
                     &mut records,
                     run as u8,
                     "capture_unavailable",
@@ -629,7 +675,7 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
             &outcome.stderr,
         )?;
 
-        let revalidation = revalidate_fixture(&fixture, &manifest, &pin);
+        let revalidation = revalidate_fixture(fixture, manifest, pin);
         let mut record = measurement_record(run as u8, outcome, &revalidation);
         match revalidation {
             Ok(snapshot) => {
@@ -675,32 +721,11 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
             }
         }
     }
-
-    let passed = records.len() == RUN_COUNT && records.iter().all(|record| record.passed);
-    let result = if inconclusive {
-        "inconclusive"
-    } else if passed {
-        "passed"
-    } else {
-        "failed"
-    };
-    write_summary(
-        &evidence,
-        SummaryInputs {
-            source_commit,
-            xtask_sha256,
-            mara_sha256,
-            expected_manifest_sha256,
-            fixture_files,
-            records,
-            result,
-        },
-    )?;
-    if passed {
-        Ok(())
-    } else {
-        Err(ToolError("scale qualification did not pass".into()))
-    }
+    Ok(MeasurementLoopResult {
+        records,
+        fixture_files,
+        inconclusive,
+    })
 }
 
 fn write_fixture(fixture: &Path) -> Result<()> {
@@ -791,14 +816,35 @@ fn canonical_xtask_executable(source_repo: &Path) -> Result<PathBuf> {
             "cannot canonicalize running mara-xtask executable: {error}"
         ))
     })?;
-    let expected = source_repo.join("target/debug/mara-xtask");
-    require_regular_file(&expected, "target/debug/mara-xtask")?;
-    let expected = fs::canonicalize(&expected).map_err(|error| {
-        ToolError(format!(
-            "cannot canonicalize target/debug/mara-xtask: {error}"
-        ))
-    })?;
+    let expected = canonical_target_executable(
+        source_repo,
+        "debug",
+        "mara-xtask",
+        "target/debug/mara-xtask",
+    )?;
     require_exact_xtask_executable(&current, &expected)
+}
+
+fn canonical_target_executable(
+    source_repo: &Path,
+    profile: &str,
+    binary: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let target = source_repo.join("target");
+    let profile_directory = target.join(profile);
+    require_real_directory(&target, "target")?;
+    require_real_directory(&profile_directory, &format!("target/{profile}"))?;
+    let executable = profile_directory.join(binary);
+    require_regular_file(&executable, label)?;
+    let canonical = fs::canonicalize(&executable)
+        .map_err(|error| ToolError(format!("cannot canonicalize {label}: {error}")))?;
+    if canonical != executable {
+        return Err(ToolError(format!(
+            "{label} must resolve within the canonical source target directory"
+        )));
+    }
+    Ok(canonical)
 }
 
 fn require_exact_xtask_executable(current: &Path, expected: &Path) -> Result<PathBuf> {
@@ -1834,6 +1880,42 @@ mod tests {
         assert!(require_exact_xtask_executable(&copied, &expected).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn target_executables_reject_symlinked_intermediate_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let source = temporary.path().join("source");
+        let external_profile = temporary.path().join("external-debug");
+        fs::create_dir_all(source.join("target")).expect("source target");
+        fs::create_dir(&external_profile).expect("external profile");
+        fs::write(external_profile.join("mara-xtask"), "executable").expect("external binary");
+        symlink(&external_profile, source.join("target/debug")).expect("symlinked profile");
+
+        assert!(
+            canonical_target_executable(&source, "debug", "mara-xtask", "target/debug/mara-xtask",)
+                .is_err()
+        );
+
+        let second_source = temporary.path().join("second-source");
+        fs::create_dir(&second_source).expect("second source");
+        symlink(
+            temporary.path().join("external-target"),
+            second_source.join("target"),
+        )
+        .expect("symlinked target");
+        assert!(
+            canonical_target_executable(
+                &second_source,
+                "debug",
+                "mara-xtask",
+                "target/debug/mara-xtask",
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn storage_capacity_and_tmpfs_are_rejected() {
         let low_capacity = StorageInfo {
@@ -2221,6 +2303,88 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn successful_measurement_loop_records_all_five_runs_and_passing_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let fixture = temporary.path().join("fixture");
+        let evidence = temporary.path().join("evidence");
+        let manifest = temporary.path().join("manifest");
+        let mara = temporary.path().join("mara");
+        fs::create_dir(&fixture).expect("fixture directory");
+        fs::create_dir(&evidence).expect("evidence directory");
+        write_fixture(&fixture).expect("fixture");
+        fs::write(&manifest, "pinned manifest\n").expect("manifest");
+        fs::write(
+            &mara,
+            "#!/bin/sh\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
+        )
+        .expect("fake Mara");
+        let mut permissions = fs::metadata(&mara).expect("Mara metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mara, permissions).expect("Mara permissions");
+        let pin = ManifestPin {
+            sha256: hash_file(&manifest).expect("manifest hash"),
+            entries: fixture_digests(&fixture).into_iter().collect(),
+        };
+
+        let measurement = run_measurement_loop(&mara, &fixture, &evidence, &manifest, &pin)
+            .expect("successful measurement loop");
+
+        assert!(!measurement.inconclusive);
+        assert_eq!(measurement.records.len(), RUN_COUNT);
+        assert!(measurement.records.iter().all(|record| record.passed));
+        assert!(measurement.records.iter().all(|record| {
+            record
+                .elapsed_ns
+                .is_some_and(|value| value <= ELAPSED_LIMIT_NS)
+                && record
+                    .peak_rss_kib
+                    .is_some_and(|value| value <= PEAK_RSS_LIMIT_KIB)
+                && record.fixture_verified == Some(true)
+        }));
+        for run in 1..=RUN_COUNT {
+            assert!(
+                evidence
+                    .join(format!("run-{run:02}.measurement.json"))
+                    .is_file()
+            );
+            assert!(evidence.join(format!("run-{run:02}.stdout.json")).is_file());
+            assert!(evidence.join(format!("run-{run:02}.stderr")).is_file());
+        }
+
+        write_summary(
+            &evidence,
+            SummaryInputs {
+                source_commit: "source-commit".into(),
+                xtask_sha256: "0".repeat(64),
+                mara_sha256: "1".repeat(64),
+                expected_manifest_sha256: Some(pin.sha256),
+                fixture_files: measurement.fixture_files,
+                records: measurement.records,
+                result: "passed",
+            },
+        )
+        .expect("passing summary");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(evidence.join("qualification-summary.json")).expect("summary bytes"),
+        )
+        .expect("summary JSON");
+        assert_eq!(
+            summary.get("result").and_then(|value| value.as_str()),
+            Some("passed")
+        );
+        assert_eq!(
+            summary
+                .get("runs")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(RUN_COUNT)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn child_capture_setup_failure_is_observable() {
         let temporary = tempfile::tempdir().expect("temporary root");
         assert!(
@@ -2326,8 +2490,9 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let temporary = tempfile::tempdir().expect("temporary root");
-        let repo = temporary.path().join("source-repository");
-        let qualification_root = temporary.path().join("qualification-root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let repo = temporary_root.join("source-repository");
+        let qualification_root = temporary_root.join("qualification-root");
         let verifier = repo.join("tests/qualification/verify-scale-v01.sh");
         let manifest = repo.join("tests/qualification/scale-v01.SHA256SUMS");
         let mara = repo.join("target/release/mara");
@@ -2418,7 +2583,7 @@ mod tests {
         )
         .expect("restore canonical manifest");
 
-        let topology_root = temporary.path().join("malformed-topology-root");
+        let topology_root = temporary_root.join("malformed-topology-root");
         let topology_fixture = topology_root.join("fixture");
         fs::create_dir(&topology_root).expect("topology qualification root");
         fs::create_dir(&topology_fixture).expect("topology fixture directory");
@@ -2446,19 +2611,19 @@ mod tests {
                 .expect("topology evidence");
         assert!(topology_evidence.contains("topology_error=malformed_target"));
 
-        let invalid_type_root = temporary.path().join("invalid-type-root");
+        let invalid_type_root = temporary_root.join("invalid-type-root");
         let invalid_type_fixture = invalid_type_root.join("fixture");
         fs::create_dir(&invalid_type_root).expect("invalid-type qualification root");
         fs::create_dir(&invalid_type_fixture).expect("invalid-type fixture directory");
         write_fixture(&invalid_type_fixture).expect("invalid-type fixture");
-        let symlink_target = temporary.path().join("outside-fixture-item");
+        let symlink_target = temporary_root.join("outside-fixture-item");
         fs::write(&symlink_target, "outside fixture").expect("symlink target");
         let invalid_item = invalid_type_fixture.join("items-000.mara.md");
         fs::remove_file(&invalid_item).expect("remove regular fixture item");
         symlink(&symlink_target, &invalid_item).expect("symlink fixture item");
         fs::create_dir(invalid_type_root.join("evidence"))
             .expect("invalid-type evidence directory");
-        let mara_marker = temporary.path().join("mara-ran-marker");
+        let mara_marker = temporary_root.join("mara-ran-marker");
         let status = Command::new("sh")
             .current_dir(&repo)
             .env("MARA_RAN_MARKER", &mara_marker)
@@ -2504,13 +2669,13 @@ mod tests {
         assert!(skipped_preflight_exit.contains("exit_code=skipped"));
         assert!(skipped_preflight_exit.contains("json_validation=skipped"));
 
-        let unsupported_root = temporary.path().join("unsupported-qualification-root");
+        let unsupported_root = temporary_root.join("unsupported-qualification-root");
         let unsupported_fixture = unsupported_root.join("fixture");
         fs::create_dir(&unsupported_root).expect("unsupported qualification root");
         fs::create_dir(&unsupported_fixture).expect("unsupported fixture directory");
         write_fixture(&unsupported_fixture).expect("unsupported fixture");
         fs::create_dir(unsupported_root.join("evidence")).expect("unsupported evidence directory");
-        let fake_bin = temporary.path().join("fake-bin");
+        let fake_bin = temporary_root.join("fake-bin");
         fs::create_dir(&fake_bin).expect("fake executable directory");
         let fake_uname = fake_bin.join("uname");
         fs::write(&fake_uname, "#!/bin/sh\nprintf '%s\\n' Unsupported\n").expect("fake uname");
