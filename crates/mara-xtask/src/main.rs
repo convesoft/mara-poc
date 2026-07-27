@@ -237,8 +237,21 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
     let source_repo = source_repository()?;
     canonical_xtask_executable(&source_repo)?;
     let candidate = candidate_root(argument_root, false)?;
-    let inside_source_control = path_is_in_source_control(&candidate.root, &source_repo)?;
     let storage = storage_info(&candidate.parent);
+    let inside_source_control = match path_is_in_source_control(&candidate.root, &source_repo) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_precondition(
+                Some(&source_repo),
+                Some(&candidate.parent),
+                Some(&candidate.root),
+                storage.as_ref().ok(),
+                None,
+                "source_control_unavailable",
+            )?;
+            return Err(error);
+        }
+    };
     if candidate.final_component_is_symlink {
         emit_precondition(
             Some(&source_repo),
@@ -889,7 +902,7 @@ fn ensure_isolated_root(root: &Path, source_repo: &Path, candidate_parent: &Path
             )));
         }
     }
-    if git_command(candidate_parent, ["rev-parse", "--show-toplevel"]).is_ok() {
+    if directory_has_git_worktree(candidate_parent)? {
         return Err(ToolError(
             "qualification-root parent is inside a Git worktree".into(),
         ));
@@ -917,12 +930,42 @@ fn path_is_in_source_control(root: &Path, source_repo: &Path) -> Result<bool> {
             return Ok(true);
         }
     }
-    Ok(git_command(
+    directory_has_git_worktree(
         root.parent()
             .ok_or_else(|| ToolError("qualification root has no parent".into()))?,
-        ["rev-parse", "--show-toplevel"],
     )
-    .is_ok())
+}
+
+fn directory_has_git_worktree(directory: &Path) -> Result<bool> {
+    directory_has_git_worktree_with_program(Path::new("git"), directory)
+}
+
+fn directory_has_git_worktree_with_program(program: &Path, directory: &Path) -> Result<bool> {
+    let output = isolated_git_process(program, directory)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|error| ToolError(format!("cannot invoke git: {error}")))?;
+    if output.status.success() {
+        return match std::str::from_utf8(&output.stdout)
+            .map_err(|error| ToolError(format!("Git emitted non-UTF-8 output: {error}")))?
+            .trim()
+        {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            value => Err(ToolError(format!(
+                "Git emitted an unexpected worktree response: {value}"
+            ))),
+        };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(128) && stderr.starts_with("fatal: not a git repository ") {
+        Ok(false)
+    } else {
+        Err(ToolError(format!(
+            "cannot inspect Git worktree context: {}",
+            stderr.trim()
+        )))
+    }
 }
 
 fn git_worktrees(source_repo: &Path) -> Result<Vec<PathBuf>> {
@@ -950,9 +993,7 @@ fn git_command<const N: usize>(
     directory: &Path,
     arguments: [&str; N],
 ) -> Result<std::process::Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
+    let output = isolated_git_process(Path::new("git"), directory)
         .args(arguments)
         .output()
         .map_err(|error| ToolError(format!("cannot invoke git: {error}")))?;
@@ -964,6 +1005,23 @@ fn git_command<const N: usize>(
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
+}
+
+fn isolated_git_process(program: &Path, directory: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env("LC_ALL", "C")
+        .arg("-C")
+        .arg(directory);
+    command
 }
 
 fn storage_info(path: &Path) -> Result<StorageInfo> {
@@ -1144,7 +1202,7 @@ fn ensure_fixture_has_no_git_context(fixture: &Path) -> Result<()> {
     if fixture.join(".git").exists() {
         return Err(ToolError("fixture must not contain .git".into()));
     }
-    if git_command(fixture, ["rev-parse", "--show-toplevel"]).is_ok() {
+    if directory_has_git_worktree(fixture)? {
         return Err(ToolError("fixture unexpectedly has Git context".into()));
     }
     Ok(())
@@ -1291,9 +1349,6 @@ fn terminate_and_reap_child(
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINTR) {
                 continue;
-            }
-            if error.raw_os_error() == Some(libc::ECHILD) {
-                return Ok(());
             }
             return Err(ToolError(format!(
                 "cannot reap child process group: {error}"
@@ -2000,6 +2055,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_probe_distinguishes_absence_from_operational_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .expect("source repository");
+        let temporary = tempfile::tempdir().expect("temporary root");
+        assert!(directory_has_git_worktree(&source).expect("source Git worktree"));
+        assert!(!directory_has_git_worktree(temporary.path()).expect("no Git worktree context"));
+
+        let failing_git = temporary.path().join("failing-git");
+        fs::write(
+            &failing_git,
+            "#!/bin/sh\nprintf 'fatal: simulated Git failure\\n' >&2\nexit 42\n",
+        )
+        .expect("failing Git probe");
+        let mut permissions = fs::metadata(&failing_git)
+            .expect("failing Git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&failing_git, permissions).expect("failing Git permissions");
+
+        let error = directory_has_git_worktree_with_program(&failing_git, temporary.path())
+            .expect_err("operational Git failure");
+        assert!(error.to_string().contains("simulated Git failure"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn revalidation_detects_an_oracle_pinned_fixture_mismatch() {
@@ -2079,6 +2162,22 @@ mod tests {
             run_exact_child_with_limit(&script, temporary.path(), &[], Duration::from_millis(10))
                 .expect("child outcome");
         assert!(outcome.timed_out);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_child_status_is_a_capture_failure() {
+        let mut status = 0;
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+
+        let error = terminate_and_reap_child(libc::pid_t::MAX, &mut status, &mut usage)
+            .expect_err("missing child status must fail capture");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reap child process group")
+        );
     }
 
     #[cfg(target_os = "linux")]
