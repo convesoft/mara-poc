@@ -2669,6 +2669,96 @@ mod tests {
         assert!(skipped_preflight_exit.contains("exit_code=skipped"));
         assert!(skipped_preflight_exit.contains("json_validation=skipped"));
 
+        let find_failure_root = temporary_root.join("find-failure-qualification-root");
+        let find_failure_fixture = find_failure_root.join("fixture");
+        fs::create_dir(&find_failure_root).expect("find-failure qualification root");
+        fs::create_dir(&find_failure_fixture).expect("find-failure fixture directory");
+        write_fixture(&find_failure_fixture).expect("find-failure fixture");
+        fs::create_dir(find_failure_root.join("evidence"))
+            .expect("find-failure evidence directory");
+        let fake_find_bin = temporary_root.join("fake-find-bin");
+        fs::create_dir(&fake_find_bin).expect("fake find directory");
+        let fake_find = fake_find_bin.join("find");
+        fs::write(
+            &fake_find,
+            "#!/bin/sh\nprintf '%s\\n' . ./.mara ./.mara/project.toml ./.mara/schema.yaml ./items-000.mara.md ./items-001.mara.md ./items-002.mara.md ./items-003.mara.md ./items-004.mara.md ./items-005.mara.md ./items-006.mara.md ./items-007.mara.md ./items-008.mara.md ./items-009.mara.md\nprintf '%s\\n' 'simulated late find failure' >&2\nexit 1\n",
+        )
+        .expect("failing find");
+        let mut permissions = fs::metadata(&fake_find)
+            .expect("failing find metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_find, permissions).expect("failing find permissions");
+        let inherited_path = env::var_os("PATH").expect("PATH");
+        let path = format!(
+            "{}:{}",
+            fake_find_bin.display(),
+            inherited_path.to_string_lossy()
+        );
+        let status = Command::new("sh")
+            .current_dir(&repo)
+            .env("PATH", path)
+            .arg(&verifier)
+            .arg("--qualification-root")
+            .arg(&find_failure_root)
+            .status()
+            .expect("run find-failure verifier");
+        assert!(!status.success());
+        assert!(
+            fs::read_to_string(find_failure_root.join("evidence/file-set-check.stderr"))
+                .expect("find-failure stderr")
+                .contains("simulated late find failure")
+        );
+
+        let hash_failure_root = temporary_root.join("hash-failure-qualification-root");
+        let hash_failure_fixture = hash_failure_root.join("fixture");
+        fs::create_dir(&hash_failure_root).expect("hash-failure qualification root");
+        fs::create_dir(&hash_failure_fixture).expect("hash-failure fixture directory");
+        write_fixture(&hash_failure_fixture).expect("hash-failure fixture");
+        fs::create_dir(hash_failure_root.join("evidence"))
+            .expect("hash-failure evidence directory");
+        let fake_hash_bin = temporary_root.join("fake-hash-bin");
+        fs::create_dir(&fake_hash_bin).expect("fake hash directory");
+        let fake_uname_for_hash = fake_hash_bin.join("uname");
+        let fake_sha256sum = fake_hash_bin.join("sha256sum");
+        fs::write(&fake_uname_for_hash, "#!/bin/sh\nprintf '%s\\n' Linux\n")
+            .expect("fake Linux uname");
+        fs::write(
+            &fake_sha256sum,
+            "#!/bin/sh\nprintf '%s\\n' 'simulated hash failure' >&2\nexit 1\n",
+        )
+        .expect("failing hash");
+        for path in [&fake_uname_for_hash, &fake_sha256sum] {
+            let mut permissions = fs::metadata(path)
+                .expect("fake hash executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("fake hash executable permissions");
+        }
+        let path = format!(
+            "{}:{}",
+            fake_hash_bin.display(),
+            inherited_path.to_string_lossy()
+        );
+        let status = Command::new("sh")
+            .current_dir(&repo)
+            .env("PATH", path)
+            .arg(&verifier)
+            .arg("--qualification-root")
+            .arg(&hash_failure_root)
+            .status()
+            .expect("run hash-failure verifier");
+        assert!(!status.success());
+        let manifest_failure =
+            fs::read_to_string(hash_failure_root.join("evidence/manifest-path-check.txt"))
+                .expect("manifest hash failure evidence");
+        assert!(manifest_failure.contains("manifest_sha256=\n"));
+        assert!(
+            fs::read_to_string(hash_failure_root.join("evidence/manifest-path-check.stderr"))
+                .expect("manifest hash failure stderr")
+                .contains("simulated hash failure")
+        );
+
         let unsupported_root = temporary_root.join("unsupported-qualification-root");
         let unsupported_fixture = unsupported_root.join("fixture");
         fs::create_dir(&unsupported_root).expect("unsupported qualification root");
@@ -2703,6 +2793,32 @@ mod tests {
             fs::read_to_string(unsupported_root.join("evidence/fixture-sha256-check.txt"))
                 .expect("unsupported-host evidence");
         assert!(unsupported_evidence.contains("host=unsupported"));
+
+        let external_release = temporary_root.join("external-release");
+        fs::rename(repo.join("target/release"), &external_release)
+            .expect("move release directory outside target");
+        symlink(&external_release, repo.join("target/release")).expect("symlink release directory");
+        let symlinked_release_root = temporary_root.join("symlinked-release-root");
+        fs::create_dir(&symlinked_release_root).expect("symlinked-release qualification root");
+        let symlinked_release_fixture = symlinked_release_root.join("fixture");
+        fs::create_dir(&symlinked_release_fixture).expect("symlinked-release fixture");
+        write_fixture(&symlinked_release_fixture).expect("symlinked-release fixture contents");
+        fs::create_dir(symlinked_release_root.join("evidence"))
+            .expect("symlinked-release evidence");
+        let output = Command::new("sh")
+            .current_dir(&repo)
+            .arg(&verifier)
+            .arg("--qualification-root")
+            .arg(&symlinked_release_root)
+            .output()
+            .expect("reject symlinked release directory");
+        assert_eq!(output.status.code(), Some(66));
+        assert!(
+            fs::read_dir(symlinked_release_root.join("evidence"))
+                .expect("empty symlinked-release evidence")
+                .next()
+                .is_none()
+        );
     }
 
     fn fixture_digests(root: &Path) -> BTreeMap<String, String> {

@@ -39,9 +39,21 @@ fi
 fixture=$root/fixture
 evidence=$root/evidence
 manifest=$repo/tests/qualification/scale-v01.SHA256SUMS
-mara=$repo/target/release/mara
+target=$repo/target
+release=$target/release
+mara=$release/mara
 if [ ! -d "$fixture" ] || [ -L "$fixture" ] || [ ! -d "$evidence" ] || [ -L "$evidence" ]; then
     printf '%s\n' 'qualification root must contain real fixture and evidence directories' >&2
+    exit 66
+fi
+if [ ! -d "$target" ] || [ -L "$target" ] || [ ! -d "$release" ] || [ -L "$release" ]; then
+    printf '%s\n' 'target and target/release must be real directories' >&2
+    exit 66
+fi
+canonical_target=$(CDPATH= cd -- "$target" && pwd -P) || exit 66
+canonical_release=$(CDPATH= cd -- "$release" && pwd -P) || exit 66
+if [ "$canonical_target" != "$target" ] || [ "$canonical_release" != "$release" ]; then
+    printf '%s\n' 'release mara executable must remain inside the canonical source target directory' >&2
     exit 66
 fi
 if [ ! -f "$manifest" ] || [ -L "$manifest" ] || [ ! -f "$mara" ] || [ -L "$mara" ]; then
@@ -65,14 +77,26 @@ done
 case $(uname -s) in
     Linux)
         host_supported=1
-        manifest_digest() { sha256sum "$manifest" | awk '{print $1}'; }
-        fixture_digest() { sha256sum "$1" | awk '{print $1}'; }
+        manifest_digest() {
+            digest_line=$(sha256sum "$manifest") || return 1
+            printf '%s\n' "${digest_line%% *}"
+        }
+        fixture_digest() {
+            digest_line=$(sha256sum "$1") || return 1
+            printf '%s\n' "${digest_line%% *}"
+        }
         verify_digests() { (CDPATH= cd -- "$fixture" && sha256sum --check "$manifest"); }
         ;;
     Darwin)
         host_supported=1
-        manifest_digest() { shasum -a 256 "$manifest" | awk '{print $1}'; }
-        fixture_digest() { shasum -a 256 "$1" | awk '{print $1}'; }
+        manifest_digest() {
+            digest_line=$(shasum -a 256 "$manifest") || return 1
+            printf '%s\n' "${digest_line%% *}"
+        }
+        fixture_digest() {
+            digest_line=$(shasum -a 256 "$1") || return 1
+            printf '%s\n' "${digest_line%% *}"
+        }
         verify_digests() { (CDPATH= cd -- "$fixture" && shasum -a 256 -c "$manifest"); }
         ;;
     *)
@@ -98,7 +122,12 @@ items-006.mara.md
 items-007.mara.md
 items-008.mara.md
 items-009.mara.md'
-actual_entries=$(CDPATH= cd -- "$fixture" && find . -print 2>"$evidence/file-set-check.stderr" | sed '/^\.$/d; s|^\./||' | sort) || failed=1
+raw_entries=$(CDPATH= cd -- "$fixture" && find . -print 2>"$evidence/file-set-check.stderr")
+find_status=$?
+if [ "$find_status" -ne 0 ]; then
+    failed=1
+fi
+actual_entries=$(printf '%s\n' "$raw_entries" | sed '/^\.$/d; s|^\./||' | sort) || failed=1
 {
     printf '%s\n' 'expected:'
     printf '%s\n' "$expected_entries"
@@ -136,7 +165,15 @@ if ! grep -qx 'file_types=ok' "$evidence/file-type-check.txt"; then
     failed=1
 fi
 
-manifest_hash=$(manifest_digest 2>>"$evidence/manifest-path-check.stderr") || manifest_hash=
+manifest_hash=$(manifest_digest 2>>"$evidence/manifest-path-check.stderr") || {
+    manifest_hash=
+    failed=1
+}
+if ! printf '%s\n' "$manifest_hash" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1 } END { exit(valid ? 0 : 1) }'
+then
+    manifest_hash=
+    failed=1
+fi
 manifest_final_lf=0
 if [ -s "$manifest" ] && [ "$(tail -c 1 "$manifest" | od -An -tu1 | tr -d '[:space:]')" = '10' ]; then
     manifest_final_lf=1
