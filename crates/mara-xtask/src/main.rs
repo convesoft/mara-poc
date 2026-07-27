@@ -238,7 +238,21 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
     canonical_xtask_executable(&source_repo)?;
     let candidate = candidate_root(argument_root, false)?;
     let inside_source_control = path_is_in_source_control(&candidate.root, &source_repo)?;
-    let storage = match storage_info(&candidate.parent) {
+    let storage = storage_info(&candidate.parent);
+    if candidate.final_component_is_symlink {
+        emit_precondition(
+            Some(&source_repo),
+            Some(&candidate.parent),
+            Some(&candidate.root),
+            storage.as_ref().ok(),
+            inside_source_control,
+            "symlinked_final_component",
+        )?;
+        return Err(ToolError(
+            "qualification-root final component must not be a symlink".into(),
+        ));
+    }
+    let storage = match storage {
         Ok(storage) => storage,
         Err(error) => {
             emit_precondition(
@@ -758,6 +772,7 @@ fn require_exact_xtask_executable(current: &Path, expected: &Path) -> Result<Pat
 struct CandidateRoot {
     root: PathBuf,
     parent: PathBuf,
+    final_component_is_symlink: bool,
 }
 
 fn candidate_root(argument: &Path, must_exist: bool) -> Result<CandidateRoot> {
@@ -779,11 +794,14 @@ fn candidate_root(argument: &Path, must_exist: bool) -> Result<CandidateRoot> {
         ))
     })?;
     let root = parent.join(final_component);
-    match fs::symlink_metadata(&root) {
+    let final_component_is_symlink = match fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ToolError(
-                "qualification-root final component must not be a symlink".into(),
-            ));
+            if must_exist {
+                return Err(ToolError(
+                    "qualification-root final component must not be a symlink".into(),
+                ));
+            }
+            true
         }
         Ok(_) if !must_exist => {
             return Err(ToolError(
@@ -805,8 +823,8 @@ fn candidate_root(argument: &Path, must_exist: bool) -> Result<CandidateRoot> {
                 "cannot inspect qualification root: {error}"
             )));
         }
-        _ => {}
-    }
+        _ => false,
+    };
     let root = if must_exist {
         fs::canonicalize(&root).map_err(|error| {
             ToolError(format!("cannot canonicalize qualification root: {error}"))
@@ -814,7 +832,11 @@ fn candidate_root(argument: &Path, must_exist: bool) -> Result<CandidateRoot> {
     } else {
         root
     };
-    Ok(CandidateRoot { root, parent })
+    Ok(CandidateRoot {
+        root,
+        parent,
+        final_component_is_symlink,
+    })
 }
 
 fn ensure_isolated_root(root: &Path, source_repo: &Path, candidate_parent: &Path) -> Result<()> {
@@ -1318,8 +1340,20 @@ fn run_exact_child_with_limit(
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
     let mut timed_out = false;
     loop {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            terminate_and_reap_child(pid, &mut status, &mut usage)
+                .map_err(|error| ToolError(format!("cannot clean up timed-out child: {error}")))?;
+            break;
+        }
         let waited = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut usage) };
         if waited == pid {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                terminate_process_group(pid).map_err(|error| {
+                    ToolError(format!("cannot clean up timed-out child group: {error}"))
+                })?;
+            }
             break;
         }
         if waited == -1 {
@@ -1333,12 +1367,6 @@ fn run_exact_child_with_limit(
                 )));
             }
             return Err(ToolError(format!("cannot wait for exact child: {error}")));
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            terminate_and_reap_child(pid, &mut status, &mut usage)
-                .map_err(|error| ToolError(format!("cannot clean up timed-out child: {error}")))?;
-            break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
@@ -1688,6 +1716,24 @@ mod tests {
         assert!(candidate_root(Path::new("relative"), false).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn generation_retains_symlinked_candidate_context_for_precondition_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let target = temporary.path().join("target");
+        let candidate_path = temporary.path().join("qualification-root");
+        fs::create_dir(&target).expect("symlink target");
+        symlink(&target, &candidate_path).expect("symlinked candidate");
+
+        let candidate = candidate_root(&candidate_path, false).expect("candidate context");
+
+        assert!(candidate.final_component_is_symlink);
+        assert_eq!(candidate.root, candidate_path);
+        assert!(candidate_root(&candidate_path, true).is_err());
+    }
+
     #[test]
     fn qualification_xtask_must_be_the_canonical_debug_executable() {
         let temporary = tempfile::tempdir().expect("temporary root");
@@ -1960,6 +2006,23 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_reap_observed_at_the_deadline_is_a_timeout() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let script = temporary.path().join("exit-immediately.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions");
+
+        let outcome = run_exact_child_with_limit(&script, temporary.path(), &[], Duration::ZERO)
+            .expect("child outcome");
+
+        assert!(outcome.timed_out);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn child_descendant_cannot_hold_capture_pipes_after_leader_exits() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let script = temporary.path().join("leave-descendant.sh");
@@ -2072,6 +2135,13 @@ mod tests {
         assert!(workflow.contains("resource-before-cleanup.txt"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\" \"$root\""));
         assert!(workflow.contains("root_used_kib=\"$(du -sk \"$root\""));
+        assert_eq!(
+            workflow
+                .matches("runner_temp_parent=\"$(CDPATH= cd -- \"$RUNNER_TEMP\" && pwd -P)\"")
+                .count(),
+            2
+        );
+        assert!(!workflow.contains("$RUNNER_TEMP/.."));
     }
 
     #[cfg(unix)]

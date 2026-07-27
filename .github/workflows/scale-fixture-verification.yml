@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
-          runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP/.." && pwd -P)"
+          runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
           tmp_used_kib="$({ du -sk "$tmp_root" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')"
           total_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $2 }')"
           available_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $4 }')"
@@ -91,7 +91,7 @@ jobs:
           test ! -L "$evidence"
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
-          runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP/.." && pwd -P)"
+          runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
           tmp_used_kib="$({ du -sk "$tmp_root" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')"
           root_used_kib="$(du -sk "$root" | awk '{ print $1 }')"
           total_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $2 }')"
