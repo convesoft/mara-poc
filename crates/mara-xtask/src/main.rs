@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", test))]
 use sha2::{Digest, Sha256};
@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
+use std::ffi::OsString;
 #[cfg(any(target_os = "linux", test))]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
@@ -212,7 +213,7 @@ struct FixtureRevalidation {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli_from(env::args_os()).unwrap_or_else(|error| error.exit());
     let result = match cli.command {
         TopLevelCommand::Qualification(qualification) => match qualification.command {
             QualificationCommand::GenerateScaleV01 { qualification_root } => {
@@ -231,6 +232,21 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn parse_cli_from<I, T>(arguments: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
+    if arguments.iter().skip(1).any(|argument| argument == "--") {
+        return Err(clap::Error::raw(
+            ErrorKind::UnknownArgument,
+            "unexpected argument '--'",
+        ));
+    }
+    Cli::try_parse_from(arguments)
 }
 
 fn generate_scale_v01(argument_root: &Path) -> Result<()> {
@@ -1865,7 +1881,6 @@ fn manifest_paths() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     #[test]
     fn fixture_is_deterministic_and_has_the_required_topology() {
@@ -1908,7 +1923,7 @@ mod tests {
     #[test]
     fn command_surface_rejects_unknown_and_relative_roots() {
         assert!(
-            Cli::try_parse_from([
+            parse_cli_from([
                 "mara-xtask",
                 "qualification",
                 "generate-scale-v01",
@@ -1918,6 +1933,19 @@ mod tests {
             ])
             .is_err()
         );
+        for command in ["generate-scale-v01", "measure-scale-v01"] {
+            assert!(
+                parse_cli_from([
+                    "mara-xtask",
+                    "qualification",
+                    command,
+                    "--qualification-root",
+                    "/qualification",
+                    "--",
+                ])
+                .is_err()
+            );
+        }
         assert!(candidate_root(Path::new("relative"), false).is_err());
     }
 
@@ -2569,8 +2597,10 @@ mod tests {
     fn workflow_uploads_evidence_before_a_cleanup_failure_can_fail_the_job() {
         let workflow = include_str!("../../../.github/workflows/scale-fixture-verification.yml");
         let upload = workflow
-            .find("- name: Upload fixture-verification evidence\n        if: always()")
-            .expect("always-upload evidence step");
+            .find(
+                "- name: Upload fixture-verification evidence\n        if: always() && steps.fixture.outputs.root != ''",
+            )
+            .expect("guarded always-upload evidence step");
         let cleanup = workflow
             .find("- name: Remove disposable external workspace\n        if: always()")
             .expect("always-run cleanup step");
@@ -2602,6 +2632,18 @@ mod tests {
         assert!(!workflow.contains("|| true"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\""));
         assert!(workflow.contains("resource-before-cleanup.txt"));
+        assert!(workflow.contains("runner_properties=\"$evidence/runner-properties.txt\""));
+        assert!(workflow.contains("source_commit=\"$(git rev-parse HEAD)\""));
+        assert!(workflow.contains("runner_image_version=%s\\n"));
+        assert!(workflow.contains("rustc --version --verbose"));
+        assert!(workflow.contains("cargo --version --verbose"));
+        assert!(workflow.contains("lscpu_begin"));
+        assert!(workflow.contains("free -b"));
+        assert!(workflow.contains("sw_vers_begin"));
+        assert!(workflow.contains("sysctl -n hw.logicalcpu"));
+        assert!(workflow.contains("sysctl -n hw.memsize"));
+        assert!(workflow.contains("if-no-files-found: error"));
+        assert!(!workflow.contains("if-no-files-found: warn"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\" \"$root\""));
         assert!(workflow.contains("root_usage=\"$(du -sk \"$root\")\""));
         assert_eq!(

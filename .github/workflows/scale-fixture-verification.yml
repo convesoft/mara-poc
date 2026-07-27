@@ -91,6 +91,9 @@ jobs:
           evidence="$root/evidence"
           test -d "$evidence"
           test ! -L "$evidence"
+          runner_properties="$evidence/runner-properties.txt"
+          test ! -e "$runner_properties"
+          test ! -L "$runner_properties"
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
           runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
@@ -110,6 +113,56 @@ jobs:
               ;;
             *) printf 'unsupported native runner: %s\n' "$RUNNER_OS" >&2; exit 1 ;;
           esac
+          native_sha256() {
+            case "$RUNNER_OS" in
+              Linux) sha256sum <"$1" | awk 'NR == 1 { print $1 }' ;;
+              macOS) shasum -a 256 <"$1" | awk 'NR == 1 { print $1 }' ;;
+            esac
+          }
+          source_commit="$(git rev-parse HEAD)"
+          xtask_sha256="$(native_sha256 target/debug/mara-xtask)"
+          mara_sha256="$(native_sha256 target/release/mara)"
+          manifest_sha256="$(native_sha256 tests/qualification/scale-v01.SHA256SUMS)"
+          verifier_sha256="$(native_sha256 tests/qualification/verify-scale-v01.sh)"
+          {
+            printf 'workflow_uri=%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'workflow_identifier=%s/%s/%s/%s\n' "$GITHUB_WORKFLOW" "$GITHUB_JOB" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'source_commit=%s\n' "$source_commit"
+            printf 'xtask_sha256=%s\n' "$xtask_sha256"
+            printf 'mara_sha256=%s\n' "$mara_sha256"
+            printf 'manifest_sha256=%s\n' "$manifest_sha256"
+            printf 'verifier_sha256=%s\n' "$verifier_sha256"
+            printf 'source_repo=%s\n' "$repo_root"
+            printf 'qualification_root=%s\n' "$root"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'runner_name=%s\n' "$RUNNER_NAME"
+            printf 'runner_image=%s\n' "${ImageOS:-}"
+            printf 'runner_image_version=%s\n' "${ImageVersion:-}"
+            printf '%s\n' 'uname_begin'
+            uname -a
+            printf '%s\n' 'uname_end' 'rustc_begin'
+            rustc --version --verbose
+            printf '%s\n' 'rustc_end' 'cargo_begin'
+            cargo --version --verbose
+            printf '%s\n' 'cargo_end'
+            case "$RUNNER_OS" in
+              Linux)
+                printf '%s\n' 'lscpu_begin'
+                lscpu
+                printf '%s\n' 'lscpu_end' 'free_bytes_begin'
+                free -b
+                printf '%s\n' 'free_bytes_end'
+                ;;
+              macOS)
+                printf '%s\n' 'sw_vers_begin'
+                sw_vers
+                printf '%s\n' 'sw_vers_end'
+                printf 'hw_logicalcpu=%s\n' "$(sysctl -n hw.logicalcpu)"
+                printf 'hw_memsize=%s\n' "$(sysctl -n hw.memsize)"
+                ;;
+            esac
+          } > "$runner_properties"
           {
             printf 'tmp_root=%s\n' "$tmp_root"
             printf 'tmp_used_kib=%s\n' "$tmp_used_kib"
@@ -131,11 +184,11 @@ jobs:
             tmpfs|ramfs) printf 'volatile runner storage: %s\n' "$filesystem_type" >&2; exit 1 ;;
           esac
       - name: Upload fixture-verification evidence
-        if: always()
+        if: always() && steps.fixture.outputs.root != ''
         uses: actions/upload-artifact@v4
         with:
           name: scale-v01-fixture-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
+          if-no-files-found: error
           path: ${{ steps.fixture.outputs.root }}/evidence
       - name: Remove disposable external workspace
         if: always()
