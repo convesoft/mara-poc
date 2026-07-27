@@ -1701,23 +1701,17 @@ fn revalidate_fixture(
     manifest: &Path,
     pin: &ManifestPin,
 ) -> Result<FixtureRevalidation> {
-    if hash_file(manifest)? != pin.sha256 {
-        return Ok(FixtureRevalidation {
-            files: fixture_mismatch_snapshot(fixture, pin)?,
-            integrity_matches: false,
-        });
-    }
     match fs::symlink_metadata(fixture) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
             return Ok(FixtureRevalidation {
-                files: fixture_mismatch_snapshot(fixture, pin)?,
+                files: fixture_mismatch_snapshot(fixture, pin, Some(""))?,
                 integrity_matches: false,
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(FixtureRevalidation {
-                files: fixture_mismatch_snapshot(fixture, pin)?,
+                files: fixture_mismatch_snapshot(fixture, pin, Some(""))?,
                 integrity_matches: false,
             });
         }
@@ -1731,13 +1725,13 @@ fn revalidate_fixture(
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => {
             return Ok(FixtureRevalidation {
-                files: fixture_mismatch_snapshot(fixture, pin)?,
+                files: fixture_mismatch_snapshot(fixture, pin, Some(".mara/"))?,
                 integrity_matches: false,
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(FixtureRevalidation {
-                files: fixture_mismatch_snapshot(fixture, pin)?,
+                files: fixture_mismatch_snapshot(fixture, pin, Some(".mara/"))?,
                 integrity_matches: false,
             });
         }
@@ -1746,6 +1740,12 @@ fn revalidate_fixture(
                 "cannot inspect fixture .mara directory: {error}"
             )));
         }
+    }
+    if hash_file(manifest)? != pin.sha256 {
+        return Ok(FixtureRevalidation {
+            files: fixture_mismatch_snapshot(fixture, pin, None)?,
+            integrity_matches: false,
+        });
     }
     let expected_names = pin
         .entries
@@ -1756,7 +1756,7 @@ fn revalidate_fixture(
     let actual_names = fixture_entry_set(fixture)?;
     if actual_names != expected_names {
         return Ok(FixtureRevalidation {
-            files: fixture_mismatch_snapshot(fixture, pin)?,
+            files: fixture_mismatch_snapshot(fixture, pin, None)?,
             integrity_matches: false,
         });
     }
@@ -1779,10 +1779,20 @@ fn revalidate_fixture(
 }
 
 #[cfg(target_os = "linux")]
-fn fixture_mismatch_snapshot(fixture: &Path, pin: &ManifestPin) -> Result<Vec<FixtureFile>> {
+fn fixture_mismatch_snapshot(
+    fixture: &Path,
+    pin: &ManifestPin,
+    blocked_ancestor: Option<&str>,
+) -> Result<Vec<FixtureFile>> {
     let mut entries = Vec::new();
     for (path, expected_sha256) in &pin.entries {
-        let observed_sha256 = file_digest_if_regular(&fixture.join(path))?;
+        let observed_sha256 = if blocked_ancestor
+            .is_some_and(|ancestor| ancestor.is_empty() || path.starts_with(ancestor))
+        {
+            None
+        } else {
+            file_digest_if_regular(&fixture.join(path))?
+        };
         entries.push(FixtureFile {
             path: path.clone(),
             expected_sha256: expected_sha256.clone(),
@@ -2395,7 +2405,43 @@ mod tests {
         };
         let snapshot = revalidate_fixture(&fixture, &manifest, &pin).expect("revalidation");
         assert!(!snapshot.integrity_matches);
-        assert!(snapshot.files.iter().all(|entry| entry.matched));
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .all(|entry| entry.observed_sha256.is_none() && !entry.matched)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn revalidation_does_not_follow_a_symlinked_mara_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let fixture = temporary.path().join("fixture");
+        fs::create_dir(&fixture).expect("fixture directory");
+        write_fixture(&fixture).expect("fixture");
+        let manifest = temporary.path().join("manifest");
+        fs::write(&manifest, "pinned manifest\n").expect("manifest");
+        let pin = ManifestPin {
+            sha256: hash_file(&manifest).expect("manifest hash"),
+            entries: fixture_digests(&fixture).into_iter().collect(),
+        };
+        let outside_mara = temporary.path().join("outside-mara");
+        fs::rename(fixture.join(".mara"), &outside_mara).expect("move Mara directory");
+        symlink(&outside_mara, fixture.join(".mara")).expect("symlink Mara directory");
+
+        let snapshot = revalidate_fixture(&fixture, &manifest, &pin).expect("revalidation");
+
+        assert!(!snapshot.integrity_matches);
+        assert!(snapshot.files.iter().all(|entry| {
+            if entry.path.starts_with(".mara/") {
+                entry.observed_sha256.is_none() && !entry.matched
+            } else {
+                entry.observed_sha256.is_some() && entry.matched
+            }
+        }));
     }
 
     #[cfg(target_os = "linux")]
