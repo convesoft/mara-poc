@@ -2594,11 +2594,11 @@ mod tests {
         assert!(!workflow.contains("shasum -a 256 -c"));
         assert_eq!(
             workflow
-                .matches("tmp_usage=\"$(du -sk \"$tmp_root\")\"")
+                .matches("tmp_usage=\"$(sudo -n du -sk \"$tmp_root\")\"")
                 .count(),
             3
         );
-        assert!(workflow.contains("post_cleanup_tmp_usage=\"$(du -sk \"$tmp_root\")\""));
+        assert!(workflow.contains("post_cleanup_tmp_usage=\"$(sudo -n du -sk \"$tmp_root\")\""));
         assert!(!workflow.contains("|| true"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\""));
         assert!(workflow.contains("resource-before-cleanup.txt"));
@@ -2717,6 +2717,31 @@ mod tests {
             include_bytes!("../../../tests/qualification/scale-v01.SHA256SUMS"),
         )
         .expect("restore canonical manifest");
+
+        let escaped_root = temporary_root.join("escaped\\qualification-root");
+        let escaped_fixture = escaped_root.join("fixture");
+        fs::create_dir(&escaped_root).expect("escaped qualification root");
+        fs::create_dir(&escaped_fixture).expect("escaped fixture directory");
+        write_fixture(&escaped_fixture).expect("escaped fixture");
+        fs::create_dir(escaped_root.join("evidence")).expect("escaped evidence directory");
+        let status = Command::new("sh")
+            .current_dir(&repo)
+            .arg(&verifier)
+            .arg("--qualification-root")
+            .arg(&escaped_root)
+            .status()
+            .expect("run verifier with checksum-escaped root");
+        assert!(status.success());
+        assert!(
+            fs::read_to_string(escaped_root.join("evidence/manifest-path-check.txt"))
+                .expect("escaped-root manifest evidence")
+                .contains("manifest_syntax=ok")
+        );
+        assert!(
+            fs::read_to_string(escaped_root.join("evidence/fixture-sha256-check.txt"))
+                .expect("escaped-root digest evidence")
+                .contains("digest_check=ok")
+        );
 
         let topology_root = temporary_root.join("malformed-topology-root");
         let topology_fixture = topology_root.join("fixture");

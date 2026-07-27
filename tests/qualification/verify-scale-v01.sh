@@ -78,11 +78,11 @@ case $(uname -s) in
     Linux)
         host_supported=1
         manifest_digest() {
-            digest_line=$(sha256sum "$manifest") || return 1
+            digest_line=$(sha256sum <"$manifest") || return 1
             printf '%s\n' "${digest_line%% *}"
         }
         fixture_digest() {
-            digest_line=$(sha256sum "$1") || return 1
+            digest_line=$(sha256sum <"$1") || return 1
             printf '%s\n' "${digest_line%% *}"
         }
         verify_digests() { (CDPATH= cd -- "$fixture" && sha256sum --check "$manifest"); }
@@ -90,11 +90,11 @@ case $(uname -s) in
     Darwin)
         host_supported=1
         manifest_digest() {
-            digest_line=$(shasum -a 256 "$manifest") || return 1
+            digest_line=$(shasum -a 256 <"$manifest") || return 1
             printf '%s\n' "${digest_line%% *}"
         }
         fixture_digest() {
-            digest_line=$(shasum -a 256 "$1") || return 1
+            digest_line=$(shasum -a 256 <"$1") || return 1
             printf '%s\n' "${digest_line%% *}"
         }
         verify_digests() { (CDPATH= cd -- "$fixture" && shasum -a 256 -c "$manifest"); }

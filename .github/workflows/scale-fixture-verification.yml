@@ -29,7 +29,7 @@ jobs:
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
           runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
-          tmp_usage="$(du -sk "$tmp_root")"
+          tmp_usage="$(sudo -n du -sk "$tmp_root")"
           tmp_used_kib="$(printf '%s\n' "$tmp_usage" | awk 'NR == 1 { print $1 }')"
           runner_temp_df="$(df -Pk "$runner_temp_parent")"
           total_kib="$(printf '%s\n' "$runner_temp_df" | awk 'NR == 2 { print $2 }')"
@@ -94,7 +94,7 @@ jobs:
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
           runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
-          tmp_usage="$(du -sk "$tmp_root")"
+          tmp_usage="$(sudo -n du -sk "$tmp_root")"
           tmp_used_kib="$(printf '%s\n' "$tmp_usage" | awk 'NR == 1 { print $1 }')"
           root_usage="$(du -sk "$root")"
           root_used_kib="$(printf '%s\n' "$root_usage" | awk 'NR == 1 { print $1 }')"
@@ -152,7 +152,7 @@ jobs:
             printf 'qualification root remained after cleanup: %s\n' "$root" >&2
             exit 1
           fi
-          post_cleanup_tmp_usage="$(du -sk "$tmp_root")"
+          post_cleanup_tmp_usage="$(sudo -n du -sk "$tmp_root")"
           post_cleanup_tmp_used_kib="$(printf '%s\n' "$post_cleanup_tmp_usage" | awk 'NR == 1 { print $1 }')"
           test -n "$post_cleanup_tmp_used_kib"
           printf 'post_cleanup_tmp_used_kib=%s\n' "$post_cleanup_tmp_used_kib"
