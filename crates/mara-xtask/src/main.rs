@@ -1550,20 +1550,71 @@ fn run_exact_child_with_limit(
         .spawn()
         .map_err(|error| ToolError(format!("cannot spawn Mara child: {error}")))?;
     let pid = child.id() as libc::pid_t;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError("child stdout was not piped".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError("child stderr was not piped".into()))?;
-    let stdout_reader = std::thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = std::thread::spawn(move || read_pipe(stderr));
-
-    let deadline = started + limit;
     let mut status = 0;
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Err(capture_setup_failure(
+                pid,
+                &mut status,
+                &mut usage,
+                "child stdout was not piped",
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            return Err(capture_setup_failure(
+                pid,
+                &mut status,
+                &mut usage,
+                "child stderr was not piped",
+            ));
+        }
+    };
+    let stdout_reader = match std::thread::Builder::new()
+        .name("mara-qualification-stdout".into())
+        .spawn(move || read_pipe(stdout))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            drop(stderr);
+            return Err(capture_setup_failure(
+                pid,
+                &mut status,
+                &mut usage,
+                &format!("cannot start stdout capture thread: {error}"),
+            ));
+        }
+    };
+    let stderr_reader = match std::thread::Builder::new()
+        .name("mara-qualification-stderr".into())
+        .spawn(move || read_pipe(stderr))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let setup_error = capture_setup_failure(
+                pid,
+                &mut status,
+                &mut usage,
+                &format!("cannot start stderr capture thread: {error}"),
+            );
+            let stdout_error = match stdout_reader.join() {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("stdout capture thread panicked".into()),
+            };
+            return Err(match stdout_error {
+                Some(stdout_error) => ToolError(format!("{setup_error}; {stdout_error}")),
+                None => setup_error,
+            });
+        }
+    };
+
+    let deadline = started + limit;
     let mut timed_out = false;
     loop {
         if Instant::now() >= deadline {
@@ -1621,6 +1672,19 @@ fn run_exact_child_with_limit(
         stdout,
         stderr,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn capture_setup_failure(
+    pid: libc::pid_t,
+    status: &mut libc::c_int,
+    usage: &mut libc::rusage,
+    message: &str,
+) -> ToolError {
+    match terminate_and_reap_child(pid, status, usage) {
+        Ok(()) => ToolError(message.into()),
+        Err(cleanup_error) => ToolError(format!("{message}; {cleanup_error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
