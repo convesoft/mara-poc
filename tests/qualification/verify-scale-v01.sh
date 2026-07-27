@@ -46,19 +46,22 @@ if [ ! -d "$fixture" ] || [ -L "$fixture" ] || [ ! -d "$evidence" ] || [ -L "$ev
     printf '%s\n' 'qualification root must contain real fixture and evidence directories' >&2
     exit 66
 fi
+manifest_safe=1
+mara_safe=1
 if [ ! -d "$target" ] || [ -L "$target" ] || [ ! -d "$release" ] || [ -L "$release" ]; then
-    printf '%s\n' 'target and target/release must be real directories' >&2
-    exit 66
+    mara_safe=0
+else
+    canonical_target=$(CDPATH= cd -- "$target" && pwd -P) || mara_safe=0
+    canonical_release=$(CDPATH= cd -- "$release" && pwd -P) || mara_safe=0
+    if [ "$mara_safe" -eq 1 ] && { [ "$canonical_target" != "$target" ] || [ "$canonical_release" != "$release" ]; }; then
+        mara_safe=0
+    fi
 fi
-canonical_target=$(CDPATH= cd -- "$target" && pwd -P) || exit 66
-canonical_release=$(CDPATH= cd -- "$release" && pwd -P) || exit 66
-if [ "$canonical_target" != "$target" ] || [ "$canonical_release" != "$release" ]; then
-    printf '%s\n' 'release mara executable must remain inside the canonical source target directory' >&2
-    exit 66
+if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+    manifest_safe=0
 fi
-if [ ! -f "$manifest" ] || [ -L "$manifest" ] || [ ! -f "$mara" ] || [ -L "$mara" ]; then
-    printf '%s\n' 'expected manifest and release mara executable must be regular files' >&2
-    exit 66
+if [ ! -f "$mara" ] || [ -L "$mara" ]; then
+    mara_safe=0
 fi
 
 for output in \
@@ -165,22 +168,23 @@ if ! grep -qx 'file_types=ok' "$evidence/file-type-check.txt"; then
     failed=1
 fi
 
-manifest_hash=$(manifest_digest 2>>"$evidence/manifest-path-check.stderr") || {
-    manifest_hash=
-    failed=1
-}
-if ! printf '%s\n' "$manifest_hash" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1 } END { exit(valid ? 0 : 1) }'
-then
-    manifest_hash=
-    failed=1
-fi
-manifest_final_lf=0
-if [ -s "$manifest" ] && [ "$(tail -c 1 "$manifest" | od -An -tu1 | tr -d '[:space:]')" = '10' ]; then
-    manifest_final_lf=1
-fi
-{
-    printf 'manifest_sha256=%s\n' "$manifest_hash"
-    awk -v manifest_final_lf="$manifest_final_lf" '
+if [ "$manifest_safe" -eq 1 ]; then
+    manifest_hash=$(manifest_digest 2>>"$evidence/manifest-path-check.stderr") || {
+        manifest_hash=
+        failed=1
+    }
+    if ! printf '%s\n' "$manifest_hash" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1 } END { exit(valid ? 0 : 1) }'
+    then
+        manifest_hash=
+        failed=1
+    fi
+    manifest_final_lf=0
+    if [ -s "$manifest" ] && [ "$(tail -c 1 "$manifest" | od -An -tu1 | tr -d '[:space:]')" = '10' ]; then
+        manifest_final_lf=1
+    fi
+    {
+        printf 'manifest_sha256=%s\n' "$manifest_hash"
+        awk -v manifest_final_lf="$manifest_final_lf" '
         BEGIN {
             expected[1] = ".mara/project.toml";
             expected[2] = ".mara/schema.yaml";
@@ -206,8 +210,17 @@ fi
             if (ok) printf "manifest_syntax=ok\n"; else printf "manifest_syntax=failed\n";
             exit(ok ? 0 : 1);
         }
-    ' "$manifest"
-} >"$evidence/manifest-path-check.txt" 2>>"$evidence/manifest-path-check.stderr" || failed=1
+        ' "$manifest"
+    } >"$evidence/manifest-path-check.txt" 2>>"$evidence/manifest-path-check.stderr" || failed=1
+else
+    : >"$evidence/manifest-path-check.stderr"
+    {
+        printf '%s\n' 'manifest_sha256='
+        printf '%s\n' 'manifest_error=unavailable'
+        printf '%s\n' 'manifest_syntax=failed'
+    } >"$evidence/manifest-path-check.txt"
+    failed=1
+fi
 if ! grep -qx 'manifest_syntax=ok' "$evidence/manifest-path-check.txt"; then
     failed=1
 fi
@@ -313,12 +326,13 @@ if ! grep -qx 'topology=ok' "$evidence/topology-check.txt"; then
     failed=1
 fi
 
-set +e
-(CDPATH= cd -- "$fixture" && "$mara" check --format json) >"$evidence/preflight-check.json" 2>"$evidence/preflight-check.stderr"
-preflight_status=$?
-set -e
-preflight_json_valid=0
-if [ "$preflight_status" -eq 0 ] && awk '
+if [ "$mara_safe" -eq 1 ]; then
+    set +e
+    (CDPATH= cd -- "$fixture" && "$mara" check --format json) >"$evidence/preflight-check.json" 2>"$evidence/preflight-check.stderr"
+    preflight_status=$?
+    set -e
+    preflight_json_valid=0
+    if [ "$preflight_status" -eq 0 ] && awk '
     BEGIN {
         expected[1] = "{";
         expected[2] = "  \"format\": \"mara.command\",";
@@ -353,14 +367,29 @@ if [ "$preflight_status" -eq 0 ] && awk '
     { if (NR > 28 || $0 != expected[NR]) valid = 0; }
     END { exit(NR == 28 && valid ? 0 : 1); }
 ' "$evidence/preflight-check.json"
-then
-    preflight_json_valid=1
-fi
-{
-    printf 'exit_code=%s\n' "$preflight_status"
-    printf 'json_validation=%s\n' "$preflight_json_valid"
-} >"$evidence/preflight-check-exit.txt"
-if [ "$preflight_status" -ne 0 ] || [ "$preflight_json_valid" -ne 1 ]; then
+    then
+        preflight_json_valid=1
+    fi
+    {
+        printf 'exit_code=%s\n' "$preflight_status"
+        printf 'json_validation=%s\n' "$preflight_json_valid"
+    } >"$evidence/preflight-check-exit.txt"
+    if [ "$preflight_status" -ne 0 ] || [ "$preflight_json_valid" -ne 1 ]; then
+        failed=1
+    fi
+else
+    {
+        printf '%s\n' '{'
+        printf '%s\n' '  "status": "skipped",'
+        printf '%s\n' '  "reason": "unsafe_release_executable"'
+        printf '%s\n' '}'
+    } >"$evidence/preflight-check.json"
+    printf '%s\n' 'skipped_due_to_unsafe_release_executable' >"$evidence/preflight-check.stderr"
+    {
+        printf '%s\n' 'exit_code=skipped'
+        printf '%s\n' 'json_validation=skipped'
+        printf '%s\n' 'reason=unsafe_release_executable'
+    } >"$evidence/preflight-check-exit.txt"
     failed=1
 fi
 else

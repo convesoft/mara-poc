@@ -198,15 +198,31 @@ jobs:
           root='${{ steps.fixture.outputs.root }}'
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
+          cleanup_failed=0
           if [ -n "$root" ] && { [ -e "$root" ] || [ -L "$root" ]; }; then
-            rm -rf -- "$root"
+            if ! rm -rf -- "$root"; then
+              printf 'qualification root cleanup command failed: %s\n' "$root" >&2
+              cleanup_failed=1
+            fi
           fi
           if [ -n "$root" ] && { [ -e "$root" ] || [ -L "$root" ]; }; then
             printf 'qualification root remained after cleanup: %s\n' "$root" >&2
+            cleanup_failed=1
+          fi
+          post_resource_failed=0
+          if ! post_cleanup_tmp_usage="$(sudo -n du -sk "$tmp_root")"; then
+            printf '%s\n' 'post-cleanup /tmp usage observation failed' >&2
+            post_cleanup_tmp_usage=
+            post_resource_failed=1
+          fi
+          post_cleanup_tmp_used_kib="$(printf '%s\n' "$post_cleanup_tmp_usage" | awk 'NR == 1 { print $1 }')"
+          if [ -z "$post_cleanup_tmp_used_kib" ]; then
+            post_resource_failed=1
+          fi
+          printf 'post_cleanup_tmp_used_kib=%s\n' "$post_cleanup_tmp_used_kib"
+          if ! df -h "$tmp_root" "$repo_root"; then
+            post_resource_failed=1
+          fi
+          if [ "$cleanup_failed" -ne 0 ] || [ "$post_resource_failed" -ne 0 ]; then
             exit 1
           fi
-          post_cleanup_tmp_usage="$(sudo -n du -sk "$tmp_root")"
-          post_cleanup_tmp_used_kib="$(printf '%s\n' "$post_cleanup_tmp_usage" | awk 'NR == 1 { print $1 }')"
-          test -n "$post_cleanup_tmp_used_kib"
-          printf 'post_cleanup_tmp_used_kib=%s\n' "$post_cleanup_tmp_used_kib"
-          df -h "$tmp_root" "$repo_root"

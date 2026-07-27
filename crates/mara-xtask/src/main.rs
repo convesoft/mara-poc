@@ -1008,20 +1008,25 @@ fn directory_has_git_worktree(directory: &Path) -> Result<bool> {
 
 fn directory_has_git_worktree_with_program(program: &Path, directory: &Path) -> Result<bool> {
     let output = isolated_git_process(program, directory)
-        .args(["rev-parse", "--is-inside-work-tree"])
+        .args(["rev-parse", "--is-inside-work-tree", "--is-inside-git-dir"])
         .output()
         .map_err(|error| ToolError(format!("cannot invoke git: {error}")))?;
     if output.status.success() {
-        return match std::str::from_utf8(&output.stdout)
+        let values: Vec<&str> = std::str::from_utf8(&output.stdout)
             .map_err(|error| ToolError(format!("Git emitted non-UTF-8 output: {error}")))?
-            .trim()
+            .lines()
+            .collect();
+        if values.len() == 2
+            && values
+                .iter()
+                .all(|value| matches!(*value, "true" | "false"))
         {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            value => Err(ToolError(format!(
-                "Git emitted an unexpected worktree response: {value}"
-            ))),
-        };
+            return Ok(values.contains(&"true"));
+        }
+        return Err(ToolError(format!(
+            "Git emitted an unexpected repository response: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        )));
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.code() == Some(128) && stderr.starts_with("fatal: not a git repository ") {
@@ -2250,6 +2255,27 @@ mod tests {
         assert!(directory_has_git_worktree(&source).expect("source Git worktree"));
         assert!(!directory_has_git_worktree(temporary.path()).expect("no Git worktree context"));
 
+        let unrelated = temporary.path().join("unrelated-repository");
+        fs::create_dir(&unrelated).expect("unrelated repository directory");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&unrelated)
+                .status()
+                .expect("initialize unrelated repository")
+                .success()
+        );
+        let git_objects = unrelated.join(".git/objects");
+        assert!(directory_has_git_worktree(&git_objects).expect("inside Git directory"));
+        assert!(
+            ensure_isolated_root(
+                &git_objects.join("qualification-root"),
+                &source,
+                &git_objects,
+            )
+            .is_err()
+        );
+
         let failing_git = temporary.path().join("failing-git");
         fs::write(
             &failing_git,
@@ -2605,10 +2631,21 @@ mod tests {
             .find("- name: Remove disposable external workspace\n        if: always()")
             .expect("always-run cleanup step");
         assert!(upload < cleanup);
-        assert!(workflow[cleanup..].contains("rm -rf -- \"$root\""));
+        let cleanup_workflow = &workflow[cleanup..];
+        let removal = cleanup_workflow
+            .find("if ! rm -rf -- \"$root\"")
+            .expect("observable cleanup command");
+        let post_resource = cleanup_workflow
+            .find("post_cleanup_tmp_used_kib")
+            .expect("post-cleanup resource evidence");
+        let final_failure = cleanup_workflow
+            .find("if [ \"$cleanup_failed\" -ne 0 ] || [ \"$post_resource_failed\" -ne 0 ]")
+            .expect("combined cleanup failure gate");
+        assert!(removal < post_resource);
+        assert!(post_resource < final_failure);
         assert!(workflow.contains("test ! -L \"$root\""));
-        assert!(workflow[cleanup..].contains("|| [ -L \"$root\" ]"));
-        assert!(workflow[cleanup..].contains("qualification root remained after cleanup"));
+        assert!(cleanup_workflow.contains("|| [ -L \"$root\" ]"));
+        assert!(cleanup_workflow.contains("qualification root remained after cleanup"));
         assert!(
             workflow.contains(
                 "filesystem_device=\"$(printf '%s\\n' \"$runner_temp_df\" | /usr/bin/awk"
@@ -2996,6 +3033,54 @@ mod tests {
                 .expect("unsupported-host evidence");
         assert!(unsupported_evidence.contains("host=unsupported"));
 
+        let missing_manifest_root = temporary_root.join("missing-manifest-root");
+        let missing_manifest_fixture = missing_manifest_root.join("fixture");
+        fs::create_dir(&missing_manifest_root).expect("missing-manifest qualification root");
+        fs::create_dir(&missing_manifest_fixture).expect("missing-manifest fixture");
+        write_fixture(&missing_manifest_fixture).expect("missing-manifest fixture contents");
+        fs::create_dir(missing_manifest_root.join("evidence")).expect("missing-manifest evidence");
+        let saved_manifest = temporary_root.join("saved-manifest");
+        fs::rename(&manifest, &saved_manifest).expect("hide manifest");
+        let status = Command::new("sh")
+            .current_dir(&repo)
+            .arg(&verifier)
+            .arg("--qualification-root")
+            .arg(&missing_manifest_root)
+            .status()
+            .expect("run missing-manifest verifier");
+        fs::rename(&saved_manifest, &manifest).expect("restore manifest");
+        assert!(!status.success());
+        assert!(
+            fs::read_to_string(missing_manifest_root.join("evidence/file-set-check.txt"))
+                .expect("missing-manifest file-set evidence")
+                .contains("items-009.mara.md")
+        );
+        assert_eq!(
+            fs::read_to_string(missing_manifest_root.join("evidence/file-type-check.txt"))
+                .expect("missing-manifest file-type evidence"),
+            "file_types=ok\n"
+        );
+        assert_eq!(
+            fs::read_to_string(missing_manifest_root.join("evidence/count-check.txt"))
+                .expect("missing-manifest count evidence"),
+            "items=10000\nedges=100000\n"
+        );
+        assert!(
+            fs::read_to_string(missing_manifest_root.join("evidence/topology-check.txt"))
+                .expect("missing-manifest topology evidence")
+                .contains("topology=ok")
+        );
+        assert!(
+            fs::read_to_string(missing_manifest_root.join("evidence/preflight-check-exit.txt"))
+                .expect("missing-manifest preflight evidence")
+                .contains("json_validation=1")
+        );
+        assert!(
+            fs::read_to_string(missing_manifest_root.join("evidence/manifest-path-check.txt"))
+                .expect("missing-manifest manifest evidence")
+                .contains("manifest_error=unavailable")
+        );
+
         let external_release = temporary_root.join("external-release");
         fs::rename(repo.join("target/release"), &external_release)
             .expect("move release directory outside target");
@@ -3014,12 +3099,26 @@ mod tests {
             .arg(&symlinked_release_root)
             .output()
             .expect("reject symlinked release directory");
-        assert_eq!(output.status.code(), Some(66));
+        assert!(!output.status.success());
         assert!(
-            fs::read_dir(symlinked_release_root.join("evidence"))
-                .expect("empty symlinked-release evidence")
-                .next()
-                .is_none()
+            fs::read_to_string(symlinked_release_root.join("evidence/file-set-check.txt"))
+                .expect("symlinked-release file-set evidence")
+                .contains("items-009.mara.md")
+        );
+        assert_eq!(
+            fs::read_to_string(symlinked_release_root.join("evidence/count-check.txt"))
+                .expect("symlinked-release count evidence"),
+            "items=10000\nedges=100000\n"
+        );
+        assert!(
+            fs::read_to_string(symlinked_release_root.join("evidence/topology-check.txt"))
+                .expect("symlinked-release topology evidence")
+                .contains("topology=ok")
+        );
+        assert!(
+            fs::read_to_string(symlinked_release_root.join("evidence/preflight-check-exit.txt"))
+                .expect("symlinked-release preflight evidence")
+                .contains("reason=unsafe_release_executable")
         );
     }
 
