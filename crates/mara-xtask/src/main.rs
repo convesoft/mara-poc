@@ -2476,7 +2476,7 @@ mod tests {
         fs::write(&manifest, "pinned manifest\n").expect("manifest");
         fs::write(
             &mara,
-            "#!/bin/sh\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
+            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nprintf '%s\\n' '{\"status\":\"ok\",\"diagnostics\":[],\"data\":{\"summary\":{\"documents\":10,\"items\":10000,\"edges\":100000}}}'\n",
         )
         .expect("fake Mara");
         let mut permissions = fs::metadata(&mara).expect("Mara metadata").permissions();
@@ -2732,7 +2732,7 @@ mod tests {
         fs::write(&verifier, verifier_source).expect("verifier");
         fs::write(
             &mara,
-            "#!/bin/sh\nif [ -n \"${MARA_RAN_MARKER:-}\" ]; then : > \"$MARA_RAN_MARKER\"; fi\ncat <<'JSON'\n{\n  \"format\": \"mara.command\",\n  \"version\": 1,\n  \"command\": \"check\",\n  \"status\": \"ok\",\n  \"project\": {\n    \"name\": \"mara-scale-v01\",\n    \"root\": \".\",\n    \"schema_name\": \"mara-scale-v01\",\n    \"schema_version\": \"0.1.0\",\n    \"schema_path\": \".mara/schema.yaml\"\n  },\n  \"diagnostics\": [],\n  \"data\": {\n    \"summary\": {\n      \"documents\": 10,\n      \"items\": 10000,\n      \"source_nodes\": 0,\n      \"edges\": 100000,\n      \"mentions\": 0,\n      \"external_nodes\": 0,\n      \"errors\": 0,\n      \"warnings\": 0,\n      \"info\": 0\n    }\n  },\n  \"error\": null\n}\nJSON\n",
+            "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1\" = check\ntest \"$2\" = --format\ntest \"$3\" = json\nif [ -n \"${MARA_RAN_MARKER:-}\" ]; then : > \"$MARA_RAN_MARKER\"; fi\ncat <<'JSON'\n{\n  \"format\": \"mara.command\",\n  \"version\": 1,\n  \"command\": \"check\",\n  \"status\": \"ok\",\n  \"project\": {\n    \"name\": \"mara-scale-v01\",\n    \"root\": \".\",\n    \"schema_name\": \"mara-scale-v01\",\n    \"schema_version\": \"0.1.0\",\n    \"schema_path\": \".mara/schema.yaml\"\n  },\n  \"diagnostics\": [],\n  \"data\": {\n    \"summary\": {\n      \"documents\": 10,\n      \"items\": 10000,\n      \"source_nodes\": 0,\n      \"edges\": 100000,\n      \"mentions\": 0,\n      \"external_nodes\": 0,\n      \"errors\": 0,\n      \"warnings\": 0,\n      \"info\": 0\n    }\n  },\n  \"error\": null\n}\nJSON\n",
         )
         .expect("Mara fixture command");
         for path in [&verifier, &mara] {
