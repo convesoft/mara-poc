@@ -245,7 +245,7 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
             Some(&candidate.parent),
             Some(&candidate.root),
             storage.as_ref().ok(),
-            inside_source_control,
+            Some(inside_source_control),
             "symlinked_final_component",
         )?;
         return Err(ToolError(
@@ -260,7 +260,7 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
                 Some(&candidate.parent),
                 Some(&candidate.root),
                 None,
-                inside_source_control,
+                Some(inside_source_control),
                 "storage_unavailable",
             )?;
             return Err(error);
@@ -277,7 +277,7 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
             Some(&candidate.parent),
             Some(&candidate.root),
             Some(&storage),
-            inside_source_control,
+            Some(inside_source_control),
             precondition_error,
         )?;
         return Err(error);
@@ -289,7 +289,7 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
             Some(&candidate.parent),
             Some(&candidate.root),
             Some(&storage),
-            inside_source_control,
+            Some(inside_source_control),
             error,
         )?;
         return Err(ToolError(error.into()));
@@ -325,9 +325,6 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
     if let Err(error) = require_real_directory(&candidate.root, "qualification root") {
         return Err(rollback_created_root(&candidate.root, error.to_string()));
     }
-    if let Err(error) = ensure_isolated_root(&root, &source_repo, &candidate.parent) {
-        return Err(rollback_created_root(&candidate.root, error.to_string()));
-    }
     let created_storage = match storage_info(&root) {
         Ok(storage) => storage,
         Err(error) => {
@@ -336,17 +333,49 @@ fn generate_scale_v01(argument_root: &Path) -> Result<()> {
                 &candidate,
                 &root,
                 None,
+                Some(false),
                 "storage_unavailable",
                 error.to_string(),
             ));
         }
     };
+    let repeated_inside_source_control = match path_is_in_source_control(&root, &source_repo) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(reject_created_root(
+                &source_repo,
+                &candidate,
+                &root,
+                Some(&created_storage),
+                None,
+                "source_control_unavailable",
+                error.to_string(),
+            ));
+        }
+    };
+    if let Err(error) = ensure_isolated_root(&root, &source_repo, &candidate.parent) {
+        let precondition_error = if repeated_inside_source_control {
+            "inside_source_control"
+        } else {
+            "root_not_isolated"
+        };
+        return Err(reject_created_root(
+            &source_repo,
+            &candidate,
+            &root,
+            Some(&created_storage),
+            Some(repeated_inside_source_control),
+            precondition_error,
+            error.to_string(),
+        ));
+    }
     if let Some(error) = storage_precondition_error(&created_storage, false) {
         return Err(reject_created_root(
             &source_repo,
             &candidate,
             &root,
             Some(&created_storage),
+            Some(false),
             error,
             format!("qualification root no longer satisfies storage preconditions: {error}"),
         ));
@@ -394,6 +423,7 @@ fn reject_created_root(
     candidate: &CandidateRoot,
     root: &Path,
     storage: Option<&StorageInfo>,
+    inside_source_control: Option<bool>,
     precondition_error: &str,
     cause: String,
 ) -> ToolError {
@@ -402,7 +432,7 @@ fn reject_created_root(
         Some(&candidate.parent),
         Some(root),
         storage,
-        false,
+        inside_source_control,
         precondition_error,
     )
     .err();
@@ -1010,7 +1040,7 @@ fn emit_precondition(
     qualification_parent: Option<&Path>,
     qualification_root: Option<&Path>,
     storage: Option<&StorageInfo>,
-    inside_source_control: bool,
+    inside_source_control: Option<bool>,
     error: &str,
 ) -> Result<()> {
     let source_repo = source_repo.map(path_text);
@@ -1027,7 +1057,7 @@ fn emit_precondition(
         available_bytes: storage.map(|value| value.available_bytes),
         minimum_available_bytes: MINIMUM_AVAILABLE_BYTES,
         on_tmpfs_or_ramfs: storage.map(|value| value.on_tmpfs_or_ramfs),
-        inside_source_control: Some(inside_source_control),
+        inside_source_control,
         error,
     };
     let mut output = serde_json::to_vec(&record)
@@ -1872,6 +1902,53 @@ mod tests {
         assert_eq!(error.to_string(), "storage gate failed");
         assert!(!root.exists());
         fs::create_dir(&root).expect("safe retry can recreate qualification root");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repeated_isolation_gate_rejects_new_git_context_with_rollback() {
+        let source_repo = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .expect("source repository");
+        let temporary = tempfile::Builder::new()
+            .prefix("mara-repeated-isolation-")
+            .tempdir_in("/var/tmp")
+            .expect("external temporary root");
+        let parent = fs::canonicalize(temporary.path()).expect("canonical external parent");
+        let root = parent.join("qualification-root");
+        fs::create_dir(&root).expect("created qualification root");
+        let candidate = CandidateRoot {
+            root: root.clone(),
+            parent: parent.clone(),
+            final_component_is_symlink: false,
+        };
+
+        ensure_isolated_root(&root, &source_repo, &parent).expect("initial isolation gate");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&parent)
+                .status()
+                .expect("initialize new parent Git context")
+                .success()
+        );
+        assert!(
+            path_is_in_source_control(&root, &source_repo).expect("repeat source-control check")
+        );
+        assert!(ensure_isolated_root(&root, &source_repo, &parent).is_err());
+
+        let storage = storage_info(&root).expect("created-root storage");
+        let error = reject_created_root(
+            &source_repo,
+            &candidate,
+            &root,
+            Some(&storage),
+            Some(true),
+            "inside_source_control",
+            "new Git context".into(),
+        );
+
+        assert_eq!(error.to_string(), "new Git context");
+        assert!(!root.exists());
     }
 
     #[cfg(unix)]
