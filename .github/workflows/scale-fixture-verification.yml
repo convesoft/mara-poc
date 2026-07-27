@@ -29,9 +29,11 @@ jobs:
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
           runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
-          tmp_used_kib="$({ du -sk "$tmp_root" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')"
-          total_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $2 }')"
-          available_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $4 }')"
+          tmp_usage="$(du -sk "$tmp_root")"
+          tmp_used_kib="$(printf '%s\n' "$tmp_usage" | awk 'NR == 1 { print $1 }')"
+          runner_temp_df="$(df -Pk "$runner_temp_parent")"
+          total_kib="$(printf '%s\n' "$runner_temp_df" | awk 'NR == 2 { print $2 }')"
+          available_kib="$(printf '%s\n' "$runner_temp_df" | awk 'NR == 2 { print $4 }')"
           {
             printf 'tmp_root=%s\n' "$tmp_root"
             printf 'tmp_used_kib=%s\n' "$tmp_used_kib"
@@ -48,7 +50,7 @@ jobs:
           case "$RUNNER_OS" in
             Linux) filesystem_type="$(stat -f -c %T "$runner_temp_parent")" ;;
             macOS)
-              filesystem_device="$(df -Pk "$runner_temp_parent" | /usr/bin/awk 'NR == 2 { print $1 }')"
+              filesystem_device="$(printf '%s\n' "$runner_temp_df" | /usr/bin/awk 'NR == 2 { print $1 }')"
               test -n "$filesystem_device"
               filesystem_type="$(/usr/sbin/diskutil info "$filesystem_device" | /usr/bin/awk -F ': *' '/^[[:space:]]*File System Personality:/ { print tolower($2); exit }')"
               ;;
@@ -92,14 +94,17 @@ jobs:
           repo_root="$(pwd -P)"
           tmp_root="$(CDPATH= cd -- /tmp && pwd -P)"
           runner_temp_parent="$(CDPATH= cd -- "$RUNNER_TEMP" && pwd -P)"
-          tmp_used_kib="$({ du -sk "$tmp_root" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')"
-          root_used_kib="$(du -sk "$root" | awk '{ print $1 }')"
-          total_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $2 }')"
-          available_kib="$(df -Pk "$runner_temp_parent" | awk 'NR == 2 { print $4 }')"
+          tmp_usage="$(du -sk "$tmp_root")"
+          tmp_used_kib="$(printf '%s\n' "$tmp_usage" | awk 'NR == 1 { print $1 }')"
+          root_usage="$(du -sk "$root")"
+          root_used_kib="$(printf '%s\n' "$root_usage" | awk 'NR == 1 { print $1 }')"
+          runner_temp_df="$(df -Pk "$runner_temp_parent")"
+          total_kib="$(printf '%s\n' "$runner_temp_df" | awk 'NR == 2 { print $2 }')"
+          available_kib="$(printf '%s\n' "$runner_temp_df" | awk 'NR == 2 { print $4 }')"
           case "$RUNNER_OS" in
             Linux) filesystem_type="$(stat -f -c %T "$runner_temp_parent")" ;;
             macOS)
-              filesystem_device="$(df -Pk "$runner_temp_parent" | /usr/bin/awk 'NR == 2 { print $1 }')"
+              filesystem_device="$(printf '%s\n' "$runner_temp_df" | /usr/bin/awk 'NR == 2 { print $1 }')"
               test -n "$filesystem_device"
               filesystem_type="$(/usr/sbin/diskutil info "$filesystem_device" | /usr/bin/awk -F ': *' '/^[[:space:]]*File System Personality:/ { print tolower($2); exit }')"
               ;;
@@ -147,7 +152,8 @@ jobs:
             printf 'qualification root remained after cleanup: %s\n' "$root" >&2
             exit 1
           fi
-          post_cleanup_tmp_used_kib="$({ du -sk "$tmp_root" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')"
+          post_cleanup_tmp_usage="$(du -sk "$tmp_root")"
+          post_cleanup_tmp_used_kib="$(printf '%s\n' "$post_cleanup_tmp_usage" | awk 'NR == 1 { print $1 }')"
           test -n "$post_cleanup_tmp_used_kib"
           printf 'post_cleanup_tmp_used_kib=%s\n' "$post_cleanup_tmp_used_kib"
           df -h "$tmp_root" "$repo_root"

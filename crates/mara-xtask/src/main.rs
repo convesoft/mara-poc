@@ -572,6 +572,10 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
             Err(_) => Err("oracle_unavailable"),
             Ok(status) if status.success() => {
                 parse_manifest_pin(&evidence.join("manifest-path-check.txt"))
+                    .and_then(|pin| {
+                        parse_oracle_fixture_files(&evidence.join("fixture-sha256-check.txt"), &pin)
+                            .map(|fixture_files| (pin, fixture_files))
+                    })
                     .map_err(|_| "fixture_revalidation_unavailable")
             }
             Ok(_) => Err("oracle_failed"),
@@ -591,8 +595,16 @@ fn measure_scale_v01_linux(argument_root: &Path) -> Result<()> {
         }
         Ok(pin) => pin,
     };
+    let (pin, oracle_fixture_files) = pin;
     let expected_manifest_sha256 = Some(pin.sha256.clone());
-    let measurement = run_measurement_loop(&mara, &fixture, &evidence, &manifest, &pin)?;
+    let measurement = run_measurement_loop(
+        &mara,
+        &fixture,
+        &evidence,
+        &manifest,
+        &pin,
+        oracle_fixture_files,
+    )?;
     let records = measurement.records;
     let fixture_files = measurement.fixture_files;
     let inconclusive = measurement.inconclusive;
@@ -638,18 +650,10 @@ fn run_measurement_loop(
     evidence: &Path,
     manifest: &Path,
     pin: &ManifestPin,
+    oracle_fixture_files: Vec<FixtureFile>,
 ) -> Result<MeasurementLoopResult> {
     let mut records = Vec::with_capacity(RUN_COUNT);
-    let mut fixture_files = pin
-        .entries
-        .iter()
-        .map(|(path, expected_sha256)| FixtureFile {
-            path: path.clone(),
-            expected_sha256: expected_sha256.clone(),
-            observed_sha256: Some(expected_sha256.clone()),
-            matched: true,
-        })
-        .collect();
+    let mut fixture_files = oracle_fixture_files;
     let mut inconclusive = false;
 
     for run in 1..=RUN_COUNT {
@@ -1256,10 +1260,12 @@ fn ensure_fixture_has_no_git_context(fixture: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn parse_manifest_pin(path: &Path) -> Result<ManifestPin> {
+    require_regular_file(path, "oracle manifest record")?;
     let contents = fs::read_to_string(path)
         .map_err(|error| ToolError(format!("cannot read oracle manifest record: {error}")))?;
     let mut sha256 = None;
     let mut entries = Vec::new();
+    let mut syntax_ok = false;
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("manifest_sha256=") {
             sha256 = Some(value.to_owned());
@@ -1270,10 +1276,13 @@ fn parse_manifest_pin(path: &Path) -> Result<ManifestPin> {
                 .ok_or_else(|| ToolError("oracle manifest record has invalid entry".into()))?;
             entries.push((path.to_owned(), digest.to_owned()));
         }
+        if line == "manifest_syntax=ok" {
+            syntax_ok = true;
+        }
     }
     let sha256 =
         sha256.ok_or_else(|| ToolError("oracle manifest record lacks digest pin".into()))?;
-    if !is_lowercase_sha256(&sha256) || entries.len() != 12 {
+    if !syntax_ok || !is_lowercase_sha256(&sha256) || entries.len() != 12 {
         return Err(ToolError("oracle manifest record is incomplete".into()));
     }
     if entries
@@ -1285,6 +1294,71 @@ fn parse_manifest_pin(path: &Path) -> Result<ManifestPin> {
         ));
     }
     Ok(ManifestPin { sha256, entries })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_oracle_fixture_files(path: &Path, pin: &ManifestPin) -> Result<Vec<FixtureFile>> {
+    require_regular_file(path, "oracle fixture digest record")?;
+    let contents = fs::read_to_string(path)
+        .map_err(|error| ToolError(format!("cannot read oracle fixture digest record: {error}")))?;
+    let mut files = Vec::new();
+    let mut digest_check_ok = false;
+    for line in contents.lines() {
+        if line == "digest_check=ok" {
+            digest_check_ok = true;
+        }
+        let Some(values) = line.strip_prefix("path=") else {
+            continue;
+        };
+        let mut fields = values.split_ascii_whitespace();
+        let fixture_path = fields
+            .next()
+            .ok_or_else(|| ToolError("oracle fixture digest record lacks path".into()))?;
+        let expected_sha256 = fields
+            .next()
+            .and_then(|field| field.strip_prefix("expected_sha256="))
+            .ok_or_else(|| {
+                ToolError("oracle fixture digest record lacks expected digest".into())
+            })?;
+        let observed_sha256 = fields
+            .next()
+            .and_then(|field| field.strip_prefix("observed_sha256="))
+            .ok_or_else(|| {
+                ToolError("oracle fixture digest record lacks observed digest".into())
+            })?;
+        let matched = fields
+            .next()
+            .and_then(|field| field.strip_prefix("matched="))
+            .ok_or_else(|| ToolError("oracle fixture digest record lacks match result".into()))?;
+        if fields.next().is_some()
+            || !is_lowercase_sha256(expected_sha256)
+            || !is_lowercase_sha256(observed_sha256)
+            || expected_sha256 != observed_sha256
+            || matched != "true"
+        {
+            return Err(ToolError(
+                "oracle fixture digest record has invalid observation".into(),
+            ));
+        }
+        files.push(FixtureFile {
+            path: fixture_path.to_owned(),
+            expected_sha256: expected_sha256.to_owned(),
+            observed_sha256: Some(observed_sha256.to_owned()),
+            matched: true,
+        });
+    }
+    if !digest_check_ok
+        || files.len() != pin.entries.len()
+        || files
+            .iter()
+            .zip(&pin.entries)
+            .any(|(file, expected)| file.path != expected.0 || file.expected_sha256 != expected.1)
+    {
+        return Err(ToolError(
+            "oracle fixture digest record does not match the manifest pin".into(),
+        ));
+    }
+    Ok(files)
 }
 
 #[cfg(target_os = "linux")]
@@ -2303,6 +2377,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn oracle_fixture_observations_require_completed_matching_verification() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let record = temporary.path().join("fixture-sha256-check.txt");
+        let expected = "0".repeat(64);
+        let observed = "1".repeat(64);
+        let pin = ManifestPin {
+            sha256: "2".repeat(64),
+            entries: vec![(".mara/project.toml".into(), expected.clone())],
+        };
+
+        fs::write(
+            &record,
+            format!(
+                "path=.mara/project.toml expected_sha256={expected} observed_sha256={expected} matched=true\n"
+            ),
+        )
+        .expect("incomplete oracle record");
+        assert!(parse_oracle_fixture_files(&record, &pin).is_err());
+
+        fs::write(
+            &record,
+            format!(
+                "path=.mara/project.toml expected_sha256={expected} observed_sha256={observed} matched=true\ndigest_check=ok\n"
+            ),
+        )
+        .expect("mismatched oracle record");
+        assert!(parse_oracle_fixture_files(&record, &pin).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn successful_measurement_loop_records_all_five_runs_and_passing_summary() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2327,9 +2432,27 @@ mod tests {
             sha256: hash_file(&manifest).expect("manifest hash"),
             entries: fixture_digests(&fixture).into_iter().collect(),
         };
+        let oracle_digest_record = evidence.join("fixture-sha256-check.txt");
+        let mut oracle_digest_contents = String::new();
+        for (path, digest) in &pin.entries {
+            oracle_digest_contents.push_str(&format!(
+                "path={path} expected_sha256={digest} observed_sha256={digest} matched=true\n"
+            ));
+        }
+        oracle_digest_contents.push_str("digest_check=ok\n");
+        fs::write(&oracle_digest_record, oracle_digest_contents).expect("oracle digest record");
+        let oracle_fixture_files =
+            parse_oracle_fixture_files(&oracle_digest_record, &pin).expect("oracle observations");
 
-        let measurement = run_measurement_loop(&mara, &fixture, &evidence, &manifest, &pin)
-            .expect("successful measurement loop");
+        let measurement = run_measurement_loop(
+            &mara,
+            &fixture,
+            &evidence,
+            &manifest,
+            &pin,
+            oracle_fixture_files,
+        )
+        .expect("successful measurement loop");
 
         assert!(!measurement.inconclusive);
         assert_eq!(measurement.records.len(), RUN_COUNT);
@@ -2456,7 +2579,11 @@ mod tests {
         assert!(workflow.contains("test ! -L \"$root\""));
         assert!(workflow[cleanup..].contains("|| [ -L \"$root\" ]"));
         assert!(workflow[cleanup..].contains("qualification root remained after cleanup"));
-        assert!(workflow.contains("filesystem_device=\"$(df -Pk \"$runner_temp_parent\""));
+        assert!(
+            workflow.contains(
+                "filesystem_device=\"$(printf '%s\\n' \"$runner_temp_df\" | /usr/bin/awk"
+            )
+        );
         assert!(workflow.contains("/usr/sbin/diskutil info \"$filesystem_device\""));
         assert!(workflow.contains("File System Personality:"));
         assert!(!workflow.contains("macOS) filesystem_type=\"$(stat -f %T"));
@@ -2467,14 +2594,22 @@ mod tests {
         assert!(!workflow.contains("shasum -a 256 -c"));
         assert_eq!(
             workflow
-                .matches("du -sk \"$tmp_root\" 2>/dev/null || true")
+                .matches("tmp_usage=\"$(du -sk \"$tmp_root\")\"")
                 .count(),
             3
         );
+        assert!(workflow.contains("post_cleanup_tmp_usage=\"$(du -sk \"$tmp_root\")\""));
+        assert!(!workflow.contains("|| true"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\""));
         assert!(workflow.contains("resource-before-cleanup.txt"));
         assert!(workflow.contains("df -h \"$tmp_root\" \"$repo_root\" \"$root\""));
-        assert!(workflow.contains("root_used_kib=\"$(du -sk \"$root\""));
+        assert!(workflow.contains("root_usage=\"$(du -sk \"$root\")\""));
+        assert_eq!(
+            workflow
+                .matches("runner_temp_df=\"$(df -Pk \"$runner_temp_parent\")\"")
+                .count(),
+            2
+        );
         assert_eq!(
             workflow
                 .matches("runner_temp_parent=\"$(CDPATH= cd -- \"$RUNNER_TEMP\" && pwd -P)\"")
